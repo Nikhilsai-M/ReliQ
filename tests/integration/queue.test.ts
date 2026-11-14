@@ -410,15 +410,35 @@ describe('reap', () => {
     );
   }
 
-  it('rechecks the current deadline and leaves an active or renewed lease in flight', async () => {
+  it('ignores a lease before its deadline', async () => {
     await queue.enqueue(job);
     const claim = await claimOne();
-    const renewed = await queue.heartbeat(claim, 2 * leaseMs);
+    expect(await reapCandidate(claim.jobId)).toEqual(['NOT_EXPIRED']);
+    expect(await redis.zscore(keys.inFlight, claim.jobId)).toBe(
+      String(claim.leaseDeadline),
+    );
+  });
+
+  it('skips a renewed lease after its original deadline has passed', async () => {
+    await queue.enqueue(job);
+    const claim = await queue.claim('worker-1', 300);
+    if (!claim) throw new Error('Expected a claim');
+    const renewed = await queue.heartbeat(claim, leaseMs);
+    await waitUntil(claim.leaseDeadline);
     expect(await reapCandidate(claim.jobId)).toEqual(['NOT_EXPIRED']);
     expect(await queue.reapExpired()).toEqual({ requeued: 0, dead: 0 });
     expect(await redis.zscore(keys.inFlight, claim.jobId)).toBe(
       String(renewed),
     );
+  });
+
+  it('rejects an expired candidate with the wrong hash state', async () => {
+    const { id } = await queue.enqueue(job);
+    await redis.zrem(keys.ready, id);
+    await redis.zadd(keys.inFlight, 0, id);
+    expect(await reapCandidate(id)).toEqual(['INCONSISTENT']);
+    expect(await redis.zscore(keys.inFlight, id)).toBe('0');
+    expect(await redis.hget(keys.job(id), 'status')).toBe('ready');
   });
 
   it('recovers an expired lease once under contention and fences the prior owner', async () => {
