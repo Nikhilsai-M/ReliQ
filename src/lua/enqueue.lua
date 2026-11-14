@@ -1,7 +1,7 @@
--- KEYS: job hash, ready set, delayed set.
+-- KEYS: job hash, ready set, delayed set, purged ID set.
 -- ARGV: job ID, type, JSON payload, priority, band offset, band width, attempt limit, schedule mode, schedule value, base delay, max delay, jitter.
 -- The same ID cannot create an additional job, even if the original was already acknowledged.
-if redis.call('EXISTS', KEYS[1]) == 1 then
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
   return {'JOB_EXISTS'} -- Leave the original job untouched.
 end -- Finish duplicate detection.
 

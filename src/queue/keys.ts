@@ -7,6 +7,7 @@ export function queueKeys(name: string) {
     delayed: `${prefix}:delayed`,
     inFlight: `${prefix}:in_flight`,
     dead: `${prefix}:dead`,
+    purged: `${prefix}:purged`,
     dlqArchive: `${prefix}:dlq_archive`,
     job: (id: string) => `${prefix}:job:${id}`,
   };

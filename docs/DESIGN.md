@@ -1,6 +1,6 @@
 # ReliQ design
 
-The queue, worker runtime, retries, and dead-letter recovery are implemented through Phase 4. The remaining sections also describe planned operator and demo features.
+The queue, worker runtime, retries, dead-letter recovery, and operator API and CLI are implemented through Phase 5. The idempotency demo is planned for Phase 6.
 
 ## Delivery and ownership
 
@@ -38,6 +38,7 @@ Keys use `reliq:{queue}:…`, where `queue` is a validated name containing lette
 | `reliq:{queue}:dead`        | Sorted set | Dead time in epoch milliseconds                                 |
 | `reliq:{queue}:job:<jobId>` | Hash       | Payload, state, attempt budget, retry policy, and current claim |
 | `reliq:{queue}:dlq_archive` | Stream     | Pending PostgreSQL archive writes for dead and replay events    |
+| `reliq:{queue}:purged`      | Set        | IDs retained after purge to prevent reuse within a queue        |
 
 The job hash holds `payload` (JSON), `type`, `priority`, `enqueuedAt`, `runAt`, `attempts`, `maxAttempts`, `status`, `lastError`, `stack`, `workerId`, `claimId`, `fencingToken`, and `replayCount`, plus the retry policy resolved for the job type at enqueue. The hash and state index change together. Ready, delayed, in-flight, and dead jobs occupy exactly their corresponding index. A succeeded job has no state index entry. Lease deadlines live in the in-flight sorted set.
 
@@ -73,6 +74,12 @@ On SIGTERM or SIGINT the worker stops submitting new claims and stops scheduling
 A handler exception invokes `fail` immediately while the worker owns its lease. The reaper handles abandoned or unconfirmed claims after expiry. Both transitions consume the attempt counted at claim and share the retry calculation. `JOB_RETRY_POLICIES` maps job types to partial settings. Defaults are three attempts, a 500 ms base, a 30,000 ms cap, and up to 250 ms of jitter. Enqueue snapshots the resolved policy, and existing jobs without delay settings use the default timing while preserving their original attempt budget.
 
 The retry delay is `min(baseDelayMs * 2^attempt + jitter, maxDelayMs)` with attempt `1` on the first claim and integer jitter sampled uniformly from zero through `jitterMs`. Lua calculates `runAt` from Redis time. Retries at the cap can still coincide. On exhaustion, Redis records the final error, optional stack, and attempt count in the live DLQ and emits an archive snapshot. `listDead` returns a page of live DLQ entries. Concurrent replays can move entries between pages. Replay uses the selected generation, retains the job ID and fencing counter, and resets the attempt budget. Bulk replay handles up to 100 selections per call and reports an outcome per selection.
+
+## Operator views and purge
+
+Depth reports `ready`, `delayed`, `inFlight`, and `dead` from a single Redis transaction. In-flight inspection reads each lease and worker atomically, calculates time remaining from Redis time, and clamps expired leases to zero. Inspection pages can shift under concurrent transitions. An indexed entry that has already moved can be omitted from a page.
+
+Purge requires a dead job and the selected `replayCount`. The script records the ID in the queue's purged set and deletes the live hash and index entry. Archived records and pending archive events are retained. The reservation prevents a caller from re-enqueueing the same ID into the same queue and colliding with archived generations. Job IDs identify jobs globally, including in PostgreSQL history and idempotency records. Producers that supply their own IDs must keep them unique across queues. The purged set grows with the number of purges.
 
 ## PostgreSQL and asynchronous writes
 

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Redis } from 'ioredis';
 import {
   InvalidClaimError,
+  DeadGenerationConflictError,
   JobExistsError,
   JobNotFoundError,
   QueueInvariantError,
@@ -21,9 +22,12 @@ import {
   enqueueReply,
   failureReply,
   heartbeatReply,
+  inFlightReply,
   jsonPayload,
   promoteLimit,
   promoteReply,
+  purgeReply,
+  queueDepthReply,
   dlqEntry,
   replayReply,
   replaySelection,
@@ -71,7 +75,7 @@ export class Queue {
     const reply = await runScript(
       this.redis,
       scripts.enqueue,
-      [this.keys.job(id), this.keys.ready, this.keys.delayed],
+      [this.keys.job(id), this.keys.ready, this.keys.delayed, this.keys.purged],
       [
         id,
         job.type,
@@ -348,6 +352,76 @@ export class Queue {
       }),
     );
     return rows.filter((row) => row !== null);
+  }
+
+  async depth() {
+    // MULTI/EXEC reads all four counters from the same Redis snapshot.
+    const counts = await this.redis
+      .multi()
+      .zcard(this.keys.ready)
+      .zcard(this.keys.delayed)
+      .zcard(this.keys.inFlight)
+      .zcard(this.keys.dead)
+      .exec();
+    const values = counts?.map(([error, value]) => {
+      if (error) throw error;
+      return value;
+    });
+    const parsed = queueDepthReply.safeParse(values);
+    if (!parsed.success)
+      throw new QueueInvariantError('Invalid queue depth results');
+    const [ready, delayed, inFlight, dead] = parsed.data;
+    return { ready, delayed, inFlight, dead };
+  }
+
+  async listInFlight(offset = 0, limit = 50) {
+    timestamp.parse(offset);
+    promoteLimit.parse(limit);
+    const ids = await this.redis.zrange(
+      this.keys.inFlight,
+      offset,
+      timestamp.parse(offset + limit - 1),
+    );
+    const rows = await Promise.all(
+      ids.map(async (id) => {
+        const reply = await runScript(
+          this.redis,
+          scripts.inspectInFlight,
+          [this.keys.job(id), this.keys.inFlight],
+          [id],
+        );
+        if (reply[0] === 'SKIPPED') return null;
+        if (reply[0] !== 'IN_FLIGHT')
+          throw new QueueInvariantError(`Inspect lease ${id}: ${reply[0]}`);
+        const [, type, workerId, attempt, leaseDeadline, leaseRemainingMs] =
+          inFlightReply.parse(reply);
+        return { id, type, workerId, attempt, leaseDeadline, leaseRemainingMs };
+      }),
+    );
+    return rows.filter((row) => row !== null);
+  }
+
+  async purge(selection: ReplaySelection): Promise<void> {
+    const { id, replayCount } = replaySelection.parse(selection);
+    const reply = await runScript(
+      this.redis,
+      scripts.purge,
+      [this.keys.job(id), this.keys.dead, this.keys.purged],
+      [id, String(replayCount)],
+    );
+    if (reply[0] === 'JOB_MISSING') throw new JobNotFoundError(id);
+    if (reply[0] === 'DEAD_CONFLICT') throw new DeadGenerationConflictError(id);
+    if (reply[0] !== 'PURGED')
+      throw new QueueInvariantError(`Purge ${id}: ${reply[0]}`);
+    const [, at, attempt] = purgeReply.parse(reply);
+    this.record({
+      jobId: id,
+      from: 'dead',
+      to: 'purged',
+      at,
+      attempt,
+      detail: { replayCount },
+    });
   }
 
   async replay(selection: ReplaySelection) {

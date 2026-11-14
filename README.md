@@ -2,6 +2,45 @@
 
 ReliQ is a Redis-backed job queue with lease recovery and a PostgreSQL dead-letter archive. See [the design](docs/DESIGN.md) for the state machine and durability guarantees.
 
+## Local API and CLI
+
+Use Node 20.19 or later in the Node 20 series and Docker Compose.
+
+```bash
+test -f .env || cp .env.example .env
+docker compose up -d --wait
+npm ci
+npm run build
+npm run db:migrate
+npm run api
+```
+
+In a second terminal, run `npm run worker` to consume jobs in `QUEUE_NAME`. In another terminal, try the CLI against the API:
+
+```bash
+printf '%s\n' '{"type":"sleep","payload":{"durationMs":1000}}' > /tmp/reliq-job.json
+npm run cli -- enqueue default --file /tmp/reliq-job.json
+npm run cli -- stats default
+npm run cli -- in-flight default --limit 20
+npm run cli -- dlq default --offset 0 --limit 20
+```
+
+Every route starts with `/queues/:queue`. Send mutation bodies as `application/json`.
+
+| Method and suffix      | Body or query                                                                                | Success                                                        |
+| ---------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `POST /jobs`           | `type`, `payload`, optional `id`, `priority`, `maxAttempts`, and either `runAt` or `delayMs` | `201` with job ID and schedule                                 |
+| `GET /stats`           |                                                                                              | `200` with live depth by state                                 |
+| `GET /in-flight`       | `offset`, `limit`                                                                            | `200` with worker IDs and lease time remaining in milliseconds |
+| `GET /dlq`             | `offset`, `limit`                                                                            | `200` with the newest dead letters first                       |
+| `POST /dlq/:id/replay` | `{ "replayCount": 0 }`                                                                       | `200` with the next generation                                 |
+| `POST /dlq/replay`     | `{ "jobs": [{ "id": "<uuid>", "replayCount": 0 }] }`                                         | `200` with one result per selection                            |
+| `DELETE /dlq/:id`      | `{ "replayCount": 0 }`                                                                       | `204`                                                          |
+
+Use the ID and `replayCount` returned by DLQ inspection for replay or purge. Run `npm run cli -- --help` for those CLI commands. Single-operation errors use `{ "error": { "code": "…", "message": "…" } }`. Bulk replay returns errors on individual results, and the CLI exits nonzero when any item fails.
+
 ## Limitations
 
 - Recovery runs only while at least one worker for the affected queue is online. When all workers stop, expired leases and due delayed jobs wait for a worker to resume maintenance.
+- The operator API binds to `127.0.0.1` and has no authentication. Depth covers the four indexed live states. Succeeded jobs retain a terminal hash.
+- Purge removes the live dead-letter entry and retains its archive and a Redis ID reservation. DLQ and in-flight pages can shift when other clients change the queue between reads.

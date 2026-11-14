@@ -24,6 +24,8 @@ export const scripts = {
   reap: loadScript('reap', retry),
   fail: loadScript('fail', retry),
   replay: loadScript('replay'),
+  purge: loadScript('purge'),
+  inspectInFlight: loadScript('inspectInFlight'),
 };
 
 export async function runScript(

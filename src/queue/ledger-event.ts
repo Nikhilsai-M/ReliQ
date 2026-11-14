@@ -4,7 +4,7 @@ export type LedgerEvent = {
   jobId: string;
   queueName: string;
   from: Status | null;
-  to: Status;
+  to: Status | 'purged';
   at: number;
   attempt: number;
   workerId?: string;

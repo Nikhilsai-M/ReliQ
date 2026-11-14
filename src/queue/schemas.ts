@@ -54,6 +54,12 @@ export const claimCredential = z.object({
 export type ClaimCredential = z.infer<typeof claimCredential>;
 
 export const promoteLimit = z.int().min(1).max(1_000);
+export const queueDepthReply = z.tuple([
+  timestamp,
+  timestamp,
+  timestamp,
+  timestamp,
+]);
 export const replaySelection = z.object({
   id: jobId,
   replayCount: z.int().nonnegative().max(2_147_483_647),
@@ -88,6 +94,19 @@ export const replayReply = z.tuple([
   timestamp,
   timestamp,
   attemptCount,
+]);
+export const purgeReply = z.tuple([
+  z.literal('PURGED'),
+  timestamp,
+  attemptCount,
+]);
+export const inFlightReply = z.tuple([
+  z.literal('IN_FLIGHT'),
+  z.string(),
+  workerId,
+  attemptCount,
+  timestamp,
+  timestamp,
 ]);
 
 export const enqueueReply = z.tuple([
