@@ -361,3 +361,133 @@ describe('ack', () => {
     ).rejects.toThrow(JobNotFoundError);
   });
 });
+
+describe('heartbeat', () => {
+  it('extends the lease and a repeat with a shorter timeout cannot shorten it', async () => {
+    const { id } = await queue.enqueue(job);
+    const claim = await claimOne();
+    const extended = await queue.heartbeat(claim, 2 * leaseMs);
+    expect(extended).toBeGreaterThan(claim.leaseDeadline);
+    expect(await queue.heartbeat(claim, 1)).toBe(extended);
+    expect(await redis.zscore(keys.inFlight, id)).toBe(String(extended));
+  });
+
+  it('rejects a wrong token and a missing job without changing the lease', async () => {
+    const { id } = await queue.enqueue(job);
+    const claim = await claimOne();
+    await expect(
+      queue.heartbeat({ ...claim, fencingToken: '2' }, leaseMs),
+    ).rejects.toBeInstanceOf(InvalidClaimError);
+    await expect(
+      queue.heartbeat({ ...claim, jobId: randomUUID() }, leaseMs),
+    ).rejects.toBeInstanceOf(JobNotFoundError);
+    expect(await redis.zscore(keys.inFlight, id)).toBe(
+      String(claim.leaseDeadline),
+    );
+  });
+
+  it('rejects an expired claim before the reaper runs', async () => {
+    await queue.enqueue(job);
+    const claim = await queue.claim('worker-1', 10);
+    if (!claim) throw new Error('Expected a claim');
+    await waitUntil(claim.leaseDeadline);
+    await expect(queue.heartbeat(claim, leaseMs)).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    expect(await redis.zscore(keys.inFlight, claim.jobId)).toBe(
+      String(claim.leaseDeadline),
+    );
+  });
+});
+
+describe('reap', () => {
+  function reapCandidate(id: string) {
+    return runScript(
+      redis,
+      scripts.reap,
+      [keys.job(id), keys.inFlight, keys.ready, keys.dead, keys.dlqArchive],
+      [id, queueName],
+    );
+  }
+
+  it('rechecks the current deadline and leaves an active or renewed lease in flight', async () => {
+    await queue.enqueue(job);
+    const claim = await claimOne();
+    const renewed = await queue.heartbeat(claim, 2 * leaseMs);
+    expect(await reapCandidate(claim.jobId)).toEqual(['NOT_EXPIRED']);
+    expect(await queue.reapExpired()).toEqual({ requeued: 0, dead: 0 });
+    expect(await redis.zscore(keys.inFlight, claim.jobId)).toBe(
+      String(renewed),
+    );
+  });
+
+  it('recovers an expired lease once under contention and fences the prior owner', async () => {
+    const enqueued = await queue.enqueue(job);
+    const first = await queue.claim('worker-1', 10);
+    if (!first) throw new Error('Expected a claim');
+    await waitUntil(first.leaseDeadline);
+    const results = await Promise.all([
+      queue.reapExpired(),
+      queue.reapExpired(),
+    ]);
+    expect(results).toContainEqual({ requeued: 0, dead: 0 });
+    expect(results).toContainEqual({ requeued: 1, dead: 0 });
+    expect(await reapCandidate(enqueued.id)).toEqual(['SKIPPED']);
+    expect(await redis.zscore(keys.ready, enqueued.id)).toBe(
+      String(readyScore('normal', enqueued.enqueuedAt)),
+    );
+
+    const second = await queue.claim('worker-2', leaseMs);
+    if (!second) throw new Error('Expected the recovered claim');
+    expect(second).toMatchObject({
+      jobId: enqueued.id,
+      attempt: 2,
+      fencingToken: '2',
+    });
+    await expect(queue.ack(first)).rejects.toBeInstanceOf(InvalidClaimError);
+    await expect(queue.heartbeat(first, leaseMs)).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    await queue.ack(second);
+  });
+
+  it('moves an exhausted lease to dead and writes one archive snapshot on repeated reap', async () => {
+    const enqueued = await queue.enqueue({ ...job, maxAttempts: 1 });
+    const claim = await queue.claim('worker-1', 10);
+    if (!claim) throw new Error('Expected a claim');
+    await waitUntil(claim.leaseDeadline);
+    expect(await queue.reapExpired()).toEqual({ requeued: 0, dead: 1 });
+    expect(await reapCandidate(enqueued.id)).toEqual(['SKIPPED']);
+    expect(await redis.zrange(keys.dead, 0, -1)).toEqual([enqueued.id]);
+    expect(await redis.zcard(keys.inFlight)).toBe(0);
+    expect(await redis.hgetall(keys.job(enqueued.id))).toMatchObject({
+      status: 'dead',
+      attempts: '1',
+      lastError: 'Visibility lease expired',
+    });
+    const snapshots = await redis.xrange(keys.dlqArchive, '-', '+');
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]?.[1]).toEqual(
+      expect.arrayContaining([
+        'event',
+        'dead',
+        'jobId',
+        enqueued.id,
+        'queueName',
+        queueName,
+        'payload',
+        JSON.stringify(job.payload),
+      ]),
+    );
+    expect(await queue.claim('worker-2', leaseMs)).toBeNull();
+  });
+
+  it('surfaces a missing job hash while preserving the orphaned lease for repair', async () => {
+    const id = randomUUID();
+    await redis.zadd(keys.inFlight, 0, id);
+    await expect(queue.reapExpired()).rejects.toThrow(QueueInvariantError);
+    expect(await redis.zscore(keys.inFlight, id)).toBe('0');
+    expect(await redis.zcard(keys.ready)).toBe(0);
+    expect(await redis.zcard(keys.dead)).toBe(0);
+  });
+});

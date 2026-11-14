@@ -14,6 +14,7 @@ import {
   claimReply,
   enqueueInput,
   enqueueReply,
+  heartbeatReply,
   jsonPayload,
   promoteLimit,
 } from './schemas.js';
@@ -27,7 +28,7 @@ export class Queue {
 
   constructor(
     private readonly redis: Redis,
-    name: string,
+    private readonly name: string,
   ) {
     this.keys = queueKeys(name);
   }
@@ -84,12 +85,17 @@ export class Queue {
     return promoted;
   }
 
-  async claim(workerId: string, visibilityTimeoutMs: number) {
+  async claim(
+    workerId: string,
+    visibilityTimeoutMs: number,
+    signal?: AbortSignal,
+  ) {
     claimInput.parse({ workerId, visibilityTimeoutMs });
+    if (signal?.aborted) return null;
     const claimId = randomUUID();
     let [jobId] = await this.redis.zrange(this.keys.ready, 0, 0);
 
-    while (jobId !== undefined) {
+    while (jobId !== undefined && !signal?.aborted) {
       const reply = await runScript(
         this.redis,
         scripts.claim,
@@ -148,4 +154,64 @@ export class Queue {
     if (status !== 'ACKED')
       throw new QueueInvariantError(`Ack ${jobId}: ${status}`);
   }
+
+  async heartbeat(
+    credential: ClaimCredential,
+    visibilityTimeoutMs: number,
+  ): Promise<number> {
+    const { jobId, workerId, claimId, fencingToken } =
+      claimCredential.parse(credential);
+    claimInput.parse({ workerId, visibilityTimeoutMs });
+    const reply = await runScript(
+      this.redis,
+      scripts.heartbeat,
+      [this.keys.job(jobId), this.keys.inFlight],
+      [jobId, workerId, claimId, fencingToken, String(visibilityTimeoutMs)],
+    );
+    if (reply[0] === 'JOB_MISSING') throw new JobNotFoundError(jobId);
+    if (reply[0] === 'INVALID_CLAIM') throw new InvalidClaimError(jobId);
+    if (reply[0] === 'INVALID_TIME')
+      throw new RangeError('Lease deadline exceeds the safe integer range');
+    if (reply[0] !== 'EXTENDED')
+      throw new QueueInvariantError(`Heartbeat ${jobId}: ${reply[0]}`);
+    return heartbeatReply.parse(reply)[1];
+  }
+
+  async reapExpired(limit = 100) {
+    const batchSize = promoteLimit.parse(limit);
+    const [seconds, microseconds] = await this.redis.time();
+    const now =
+      Number(seconds) * 1000 + Math.floor(Number(microseconds) / 1000);
+    const ids = await this.redis.zrangebyscore(
+      this.keys.inFlight,
+      '-inf',
+      now,
+      'LIMIT',
+      0,
+      batchSize,
+    );
+    let requeued = 0;
+    let dead = 0;
+    for (const id of ids) {
+      const [status] = await runScript(
+        this.redis,
+        scripts.reap,
+        [
+          this.keys.job(id),
+          this.keys.inFlight,
+          this.keys.ready,
+          this.keys.dead,
+          this.keys.dlqArchive,
+        ],
+        [id, this.name],
+      );
+      if (status === 'NOT_EXPIRED' || status === 'SKIPPED') continue;
+      if (status === 'REQUEUED') requeued++;
+      else if (status === 'DEAD') dead++;
+      else throw new QueueInvariantError(`Reap ${id}: ${status}`);
+    }
+    return { requeued, dead };
+  }
 }
+
+export type ClaimedJob = NonNullable<Awaited<ReturnType<Queue['claim']>>>;

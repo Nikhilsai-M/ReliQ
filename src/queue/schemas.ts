@@ -4,6 +4,7 @@ import { priorities } from './priority.js';
 const jobId = z.uuid();
 const timestamp = z.int().nonnegative();
 const workerId = z.string().min(1);
+export const queueName = z.string().regex(/^[A-Za-z0-9_-]+$/);
 const attemptCount = z.int().positive().max(2_147_483_647);
 const fencingToken = z.string().regex(/^[1-9][0-9]*$/);
 
@@ -53,6 +54,7 @@ export const claimCredential = z.object({
 export type ClaimCredential = z.infer<typeof claimCredential>;
 
 export const promoteLimit = z.int().min(1).max(1_000);
+export const heartbeatReply = z.tuple([z.literal('EXTENDED'), timestamp]);
 
 export const enqueueReply = z.tuple([
   z.literal('ENQUEUED'),

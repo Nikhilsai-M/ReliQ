@@ -13,9 +13,11 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run tests/unit",
+    "pretest:integration": "npm run build",
     "test:integration": "node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration",
     "db:migrate": "node --env-file=.env dist/scripts/migrate.js",
-    "infra:check": "node --env-file=.env dist/scripts/check-connections.js"
+    "infra:check": "node --env-file=.env dist/scripts/check-connections.js",
+    "worker": "node --env-file=.env dist/scripts/worker.js"
   },
   "dependencies": {
     "ioredis": "^5.6.0",

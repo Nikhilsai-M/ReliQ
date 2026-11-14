@@ -18,6 +18,8 @@ export const scripts = {
   promoteDue: loadScript('promoteDue'),
   claim: loadScript('claim'),
   ack: loadScript('ack'),
+  heartbeat: loadScript('heartbeat'),
+  reap: loadScript('reap'),
 };
 
 export async function runScript(
