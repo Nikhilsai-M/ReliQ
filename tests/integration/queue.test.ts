@@ -446,7 +446,12 @@ describe('reap', () => {
   });
 
   it('recovers an expired lease once under contention and fences the prior owner', async () => {
-    const enqueued = await queue.enqueue(job);
+    const producer = new Queue(redis, queueName, {
+      retryPolicies: {
+        test: { maxAttempts: 3, baseDelayMs: 20, maxDelayMs: 100, jitterMs: 0 },
+      },
+    });
+    const enqueued = await producer.enqueue(job);
     const first = await queue.claim('worker-1', 10);
     if (!first) throw new Error('Expected a claim');
     await waitUntil(first.leaseDeadline);
@@ -458,7 +463,7 @@ describe('reap', () => {
     expect(results).toContainEqual({ requeued: 1, dead: 0 });
     expect(await reapCandidate(enqueued.id)).toEqual(['SKIPPED']);
     const runAt = await redis.zscore(keys.delayed, enqueued.id);
-    expect(Number(runAt)).toBeGreaterThanOrEqual(first.leaseDeadline + 1_000);
+    expect(Number(runAt)).toBeGreaterThanOrEqual(first.leaseDeadline + 40);
     expect(await queue.claim('worker-2', leaseMs)).toBeNull();
     await waitUntil(Number(runAt));
     expect(await queue.promoteDue()).toBe(1);
@@ -522,6 +527,57 @@ describe('reap', () => {
 });
 
 describe('fail and replay', () => {
+  it('rejects repeat fail with the same token without changing the retry or archive', async () => {
+    const { id } = await queue.enqueue(job);
+    const claim = await claimOne();
+    await queue.fail(claim, 'original error');
+    const schedule = await redis.zscore(keys.delayed, id);
+    expect(schedule).not.toBeNull();
+    await expect(queue.fail(claim, 'repeat error')).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    expect(await redis.zrange(keys.delayed, 0, -1, 'WITHSCORES')).toEqual([
+      id,
+      schedule,
+    ]);
+    expect(await redis.hget(keys.job(id), 'lastError')).toBe('original error');
+    expect(await redis.xlen(keys.dlqArchive)).toBe(0);
+
+    const terminal = await queue.enqueue({ ...job, maxAttempts: 1 });
+    const last = await claimOne();
+    await queue.fail(last, 'terminal error');
+    const archive = await redis.xrange(keys.dlqArchive, '-', '+');
+    expect(archive).toHaveLength(1);
+    await expect(queue.fail(last, 'repeat terminal')).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    expect(await redis.xrange(keys.dlqArchive, '-', '+')).toEqual(archive);
+    expect(await redis.zrange(keys.dead, 0, -1)).toEqual([terminal.id]);
+  });
+
+  it('lists the DLQ newest first across full, partial and empty pages', async () => {
+    expect(await queue.listDead()).toEqual([]);
+    const ids: string[] = [];
+    for (let index = 0; index < 5; index++) {
+      const { id } = await queue.enqueue({ ...job, maxAttempts: 1 });
+      await queue.fail(await claimOne(), `failure ${index}`);
+      ids.unshift(id);
+      const deadAt = Number(await redis.zscore(keys.dead, id));
+      await expect
+        .poll(() => redisTime(), { interval: 2 })
+        .toBeGreaterThan(deadAt);
+    }
+    expect((await queue.listDead(0, 2)).map(({ id }) => id)).toEqual(
+      ids.slice(0, 2),
+    );
+    expect((await queue.listDead(2, 2)).map(({ id }) => id)).toEqual(
+      ids.slice(2, 4),
+    );
+    expect((await queue.listDead(4, 2)).map(({ id }) => id)).toEqual(
+      ids.slice(4),
+    );
+    expect(await queue.listDead(5, 2)).toEqual([]);
+  });
   it('calculates exact backoff and jitter boundaries without mutating Redis state', async () => {
     const source = await readFile(
       new URL('../../src/lua/retry.lua', import.meta.url),

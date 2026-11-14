@@ -20,6 +20,10 @@ export class Ledger {
     private readonly capacity = 1_000,
   ) {}
 
+  get droppedCount(): number {
+    return this.dropped;
+  }
+
   record(event: LedgerEvent): void {
     if (this.pending.length >= this.capacity) {
       this.dropped++;

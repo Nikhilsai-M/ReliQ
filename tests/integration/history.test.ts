@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Pool } from 'pg';
 import { pino } from 'pino';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/env.js';
 import { createLogger } from '../../src/config/logger.js';
 import { DeadLetterArchive } from '../../src/db/archive.js';
@@ -15,17 +15,24 @@ import { createRedis } from '../../src/queue/redis.js';
 
 const config = loadConfig();
 const logger = createLogger('silent');
-const redis = createRedis(config.REDIS_URL, logger);
-const admin = createPostgresPool(config.DATABASE_URL, logger);
-const name = `history-${randomUUID()}`;
-const keys = queueKeys(name);
-const schema = `reliq_test_${randomUUID().replaceAll('-', '')}`;
+let redis: ReturnType<typeof createRedis>;
+let admin: Pool;
+let name: string;
+let keys: ReturnType<typeof queueKeys>;
+let schema: string;
 const migrations = resolve('src/db/migrations');
-const ids: string[] = [];
+let ids: string[];
 let pool: Pool;
 let schemaCreated = false;
 
-beforeAll(async () => {
+beforeEach(async () => {
+  name = `history-${randomUUID()}`;
+  keys = queueKeys(name);
+  schema = `reliq_test_${randomUUID().replaceAll('-', '')}`;
+  ids = [];
+  schemaCreated = false;
+  redis = createRedis(config.REDIS_URL, logger);
+  admin = createPostgresPool(config.DATABASE_URL, logger);
   await redis.connect();
   await admin.query(`CREATE SCHEMA ${schema}`);
   schemaCreated = true;
@@ -35,7 +42,65 @@ beforeAll(async () => {
   pool = createPostgresPool(url.href, logger);
 });
 
-afterAll(async () => {
+it('applies redelivered dead and replay events without duplicating the row or rewriting replayed_at', async () => {
+  await migrate(pool, migrations);
+  const queue = new Queue(redis, name);
+  const archive = new DeadLetterArchive(redis, pool, name, logger);
+  const { id } = await queue.enqueue({
+    type: 'demo',
+    payload: 'sample',
+    maxAttempts: 1,
+  });
+  ids.push(id);
+  const claim = await queue.claim('worker', 30_000);
+  if (!claim) throw new Error('Expected claim');
+  await queue.fail(claim, 'first error');
+  await queue.replay({ id, replayCount: 0 });
+  const original = await redis.xrange(keys.dlqArchive, '-', '+');
+  const dead = original[0]?.[1];
+  const replay = original[1]?.[1];
+  if (!dead || !replay) throw new Error('Expected both archive events');
+  expect(await archive.flush()).toBe(2);
+
+  const archived = () =>
+    pool.query<{ replayed_at: Date; last_error: string }>(
+      'SELECT replayed_at, last_error FROM dead_letter WHERE job_id = $1',
+      [id],
+    );
+  const snapshot = (await archived()).rows;
+  expect(snapshot).toEqual([
+    { replayed_at: expect.any(Date), last_error: 'first error' },
+  ]);
+
+  await redis.xadd(keys.dlqArchive, '*', ...dead);
+  await redis.xadd(keys.dlqArchive, '*', ...replay);
+  const later = [...replay];
+  const timestampIndex = later.indexOf('replayedAt') + 1;
+  later[timestampIndex] = String(Number(later[timestampIndex]) + 10_000);
+  await redis.xadd(keys.dlqArchive, '*', ...later);
+  expect(await archive.flush()).toBe(3);
+  expect((await archived()).rows).toEqual(snapshot);
+  expect(await redis.xlen(keys.dlqArchive)).toBe(0);
+});
+
+it('increments the overflow counter while enqueue, claim and ack still succeed', async () => {
+  const ledger = new Ledger(pool, logger, 1);
+  const queue = new Queue(redis, name, {
+    record: (event) => ledger.record(event),
+  });
+  const { id } = await queue.enqueue({ type: 'demo', payload: null });
+  ids.push(id);
+  expect(ledger.droppedCount).toBe(0);
+  const claim = await queue.claim('worker', 30_000);
+  if (!claim) throw new Error('Expected claim');
+  expect(claim.jobId).toBe(id);
+  expect(ledger.droppedCount).toBe(1);
+  await queue.ack(claim);
+  expect(ledger.droppedCount).toBe(2);
+  expect(await redis.hget(keys.job(id), 'status')).toBe('succeeded');
+});
+
+afterEach(async () => {
   try {
     if (redis.status === 'ready') {
       await redis.unlink(
