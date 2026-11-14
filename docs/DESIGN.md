@@ -45,7 +45,7 @@ The `dlq_archive` stream never holds live queue state.
 
 The ready score is `priorityRank * 10_000_000_000_000 + enqueueTimeMs` with high `0`, normal `1`, and low `2`. An enqueue timestamp below `10_000_000_000_000` keeps the priority bands separate and the largest score below `30_000_000_000_000`. Redis scores represent integers exactly through `2^53` (`9_007_199_254_740_992`). Validate that the timestamp still fits before packing the score. Redis breaks equal-score ties lexicographically by member, so jobs enqueued in the same millisecond with the same priority can run out of insertion order. A sustained higher-priority backlog can starve lower-priority jobs. [Redis ZADD](https://redis.io/docs/latest/commands/zadd/)
 
-Enqueue stores the computed `readyScore` in the job hash so promotion can reuse the same ordering.
+Promotion deliberately reuses `readyScore` from the original enqueue. Once eligible, an older scheduled job can move ahead of newer ready jobs of the same priority. `runAt` controls eligibility, and the original enqueue timestamp controls ordering within the priority band.
 
 ## Lua transition contracts
 

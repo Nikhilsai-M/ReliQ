@@ -177,6 +177,22 @@ describe('promoteDue', () => {
     expect(await redis.zrange(keys.delayed, 0, -1)).toEqual([id]);
     expect(await redis.zcard(keys.ready)).toBe(0);
   });
+
+  it('promotes an older scheduled job ahead of newer ready jobs of the same priority', async () => {
+    const older = await queue.enqueue({ ...job, delayMs: 100 });
+    await waitUntil(older.enqueuedAt + 1);
+    const newer = await queue.enqueue(job);
+    expect(newer.enqueuedAt).toBeGreaterThan(older.enqueuedAt);
+    await waitUntil(older.runAt);
+    const scriptKeys = [keys.job(older.id), keys.delayed, keys.ready];
+    expect(
+      await runScript(redis, scripts.promoteDue, scriptKeys, [older.id]),
+    ).toEqual(['PROMOTED']);
+    expect(
+      await runScript(redis, scripts.promoteDue, scriptKeys, [older.id]),
+    ).toEqual(['SKIPPED']);
+    expect(await redis.zrange(keys.ready, 0, -1)).toEqual([older.id, newer.id]);
+  });
 });
 
 describe('claim', () => {
@@ -221,6 +237,21 @@ describe('claim', () => {
     );
     expect(reply).toEqual(['CONTENDED', next.id]);
     expect(await redis.zrange(keys.ready, 0, -1)).toEqual([next.id]);
+  });
+
+  it('repeating the same claim script arguments cannot increment the counters twice', async () => {
+    const { id } = await queue.enqueue(job);
+    const scriptKeys = [keys.job(id), keys.ready, keys.inFlight];
+    const args = [id, 'worker-1', randomUUID(), String(leaseMs)];
+    expect((await runScript(redis, scripts.claim, scriptKeys, args))[0]).toBe(
+      'CLAIMED',
+    );
+    expect(await runScript(redis, scripts.claim, scriptKeys, args)).toEqual([
+      'EMPTY',
+    ]);
+    expect(await redis.hmget(keys.job(id), 'attempts', 'fencingToken')).toEqual(
+      ['1', '1'],
+    );
   });
 
   it('gives each of 32 simultaneous workers a different job in one claim call', async () => {
