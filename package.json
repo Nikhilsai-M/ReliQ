@@ -19,7 +19,9 @@
     "infra:check": "node --env-file=.env dist/scripts/check-connections.js",
     "worker": "node --env-file=.env dist/scripts/worker.js",
     "api": "node --env-file=.env dist/scripts/api.js",
-    "cli": "node --env-file=.env dist/src/cli/cli.js"
+    "cli": "node --env-file=.env dist/src/cli/cli.js",
+    "chaos": "node dist/scripts/chaos/run.js",
+    "test:mutations": "node dist/scripts/chaos/mutations.js"
   },
   "dependencies": {
     "express": "^5.3.0",

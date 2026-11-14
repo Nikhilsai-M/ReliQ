@@ -11,6 +11,7 @@ import { migrate } from '../../src/db/migrate.js';
 import { createPostgresPool } from '../../src/db/pool.js';
 import { queueKeys } from '../../src/queue/keys.js';
 import { Queue } from '../../src/queue/queue.js';
+import { createTransferHandler } from '../../src/jobs/transfer.js';
 import { createRedis } from '../../src/queue/redis.js';
 
 const config = loadConfig();
@@ -98,6 +99,70 @@ it('increments the overflow counter while enqueue, claim and ack still succeed',
   await queue.ack(claim);
   expect(ledger.droppedCount).toBe(2);
   expect(await redis.hget(keys.job(id), 'status')).toBe('succeeded');
+});
+
+it('rolls back the debit key on failure and applies each transfer step once under concurrent execution', async () => {
+  await migrate(pool, migrations);
+  const queue = new Queue(redis, name);
+  const debitAccountId = randomUUID();
+  const creditAccountId = randomUUID();
+  await pool.query(
+    'INSERT INTO accounts (id, balance_cents) VALUES ($1, 0), ($2, 0)',
+    [debitAccountId, creditAccountId],
+  );
+  const { id } = await queue.enqueue({
+    type: 'transfer',
+    payload: { debitAccountId, creditAccountId, amountCents: 25 },
+  });
+  ids.push(id);
+  const claim = await queue.claim('transfer-test', 30_000);
+  if (!claim) throw new Error('Expected transfer claim');
+  const handler = createTransferHandler(pool);
+  const signal = new AbortController().signal;
+  await expect(handler(claim, signal)).rejects.toThrow('Insufficient funds');
+  expect(
+    (await pool.query('SELECT 1 FROM idempotency_keys WHERE job_id = $1', [id]))
+      .rowCount,
+  ).toBe(0);
+  expect(
+    (await pool.query('SELECT 1 FROM transfers WHERE job_id = $1', [id]))
+      .rowCount,
+  ).toBe(0);
+
+  await pool.query('UPDATE accounts SET balance_cents = 100 WHERE id = $1', [
+    debitAccountId,
+  ]);
+  await Promise.all([
+    handler(claim, signal),
+    handler({ ...claim, workerId: 'concurrent-run' }, signal),
+  ]);
+  const { rows: effects } = await pool.query(
+    'SELECT step_key FROM transfer_effects WHERE job_id = $1 ORDER BY step_key',
+    [id],
+  );
+  expect(effects).toEqual([
+    { step_key: 'credit' },
+    { step_key: 'debit' },
+    { step_key: 'receipt' },
+  ]);
+  expect(
+    (
+      await pool.query('SELECT 1 FROM transfer_executions WHERE job_id = $1', [
+        id,
+      ])
+    ).rowCount,
+  ).toBe(3);
+  expect(
+    (await pool.query('SELECT 1 FROM receipts WHERE job_id = $1', [id]))
+      .rowCount,
+  ).toBe(1);
+  const { rows } = await pool.query('SELECT id, balance_cents FROM accounts');
+  expect(rows).toEqual(
+    expect.arrayContaining([
+      { id: debitAccountId, balance_cents: '75' },
+      { id: creditAccountId, balance_cents: '25' },
+    ]),
+  );
 });
 
 afterEach(async () => {

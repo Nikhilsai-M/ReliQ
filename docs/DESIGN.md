@@ -1,6 +1,6 @@
 # ReliQ design
 
-The queue, worker runtime, retries, dead-letter recovery, and operator API and CLI are implemented through Phase 5. The idempotency demo is planned for Phase 6.
+The queue, worker runtime, retries, dead-letter recovery, operator API and CLI, and transfer demo are implemented through Phase 6.
 
 ## Delivery and ownership
 
@@ -89,6 +89,14 @@ Purge requires a dead job and the selected `replayCount`. The script records the
 - `idempotency_keys` uses a composite primary key `(job_id, step_key)`. In each debit, credit, or receipt transaction, attempt `INSERT ... ON CONFLICT DO NOTHING RETURNING ...`. Apply the side effect only if the insert returned a row and commit both together. Roll back both if the effect fails. Each step gets its own key. A transfer can be partially applied between steps and needs operator recovery if it reaches dead. Balances use integer cents. The demo models a receipt as a PostgreSQL row. A real send would need a provider accepting an idempotency key or a transactional outbox paired with downstream deduplication.
 
 The plain SQL migration runner applies pending files and records their checksums in one PostgreSQL transaction. A transaction-scoped advisory lock serializes concurrent runners. Once applied, migration files are immutable. Add a new numbered file for changes. [PostgreSQL advisory lock functions](https://www.postgresql.org/docs/16/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS)
+
+## Crash measurement
+
+The transfer writes its step key and effect in one PostgreSQL transaction. The debit transaction persists the transfer and subtracts funds. Credit uses the committed transfer and the final transaction creates the receipt row. Each committed effect adds an audit row in that same transaction. The audit table deliberately accepts duplicate rows, so it can reveal repeated applications. Handler starts have their own table and may legitimately repeat. Account balances and receipt counts independently check the effect audit totals.
+
+The seeded harness picks a worker and a short pause at the debit checkpoint, then sends SIGKILL. Five replacement workers process the backlog. After the final batch of acknowledged enqueues, the harness invokes `docker restart` in the graceful scenario and `docker kill --signal SIGKILL` in the hard-crash scenario. Recent writes in the hard scenario can survive if the host and its page cache remain running. This experiment measures process death and restart on that host. A host power loss or storage failure has a different durability boundary.
+
+The producer journals every acknowledged job ID. Completion requires a committed receipt and either an observed worker acknowledgment or terminal success in Redis. Once the queue drains or the observation window ends, missing completed IDs are reported as lost for that run. A Redis rollback can make a previously observed success claimable again. The handler step keys prevent reapplying its committed effects. Mutation tests remove the token comparison and expiry guard in temporary copies and verify that each changed guard causes its targeted test to fail.
 
 ## Failure modes
 

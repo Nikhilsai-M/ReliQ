@@ -70,6 +70,7 @@ describe('PostgreSQL migrations', () => {
       '001_queue_history.sql',
       '002_idempotency_demo.sql',
       '003_preserve_archive_json.sql',
+      '004_transfer_observations.sql',
     ]);
     expect(results).toContainEqual([]);
     expect(await migrate(pool, migrationsDirectory)).toEqual([]);
@@ -85,6 +86,8 @@ describe('PostgreSQL migrations', () => {
       'jobs_ledger',
       'receipts',
       'schema_migrations',
+      'transfer_effects',
+      'transfer_executions',
       'transfers',
     ]);
 
@@ -106,9 +109,10 @@ describe('PostgreSQL migrations', () => {
       '001_queue_history.sql',
       '002_idempotency_demo.sql',
       '003_preserve_archive_json.sql',
+      '004_transfer_observations.sql',
     ];
-    const probe = '004_probe.sql';
-    const fails = '005_fails.sql';
+    const probe = '005_probe.sql';
+    const fails = '006_fails.sql';
     try {
       for (const name of history) {
         await copyFile(join(migrationsDirectory, name), join(directory, name));

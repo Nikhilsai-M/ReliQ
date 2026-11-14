@@ -41,6 +41,24 @@ Every route starts with `/queues/:queue`. Send mutation bodies as `application/j
 
 Use the ID and `replayCount` returned by DLQ inspection for replay or purge. Run `npm run cli -- --help` for those CLI commands. Single-operation errors use `{ "error": { "code": "…", "message": "…", "details": [] } }`. Bulk replay returns the same error fields on individual results, and the CLI exits nonzero when any item fails.
 
+## Transfer demo and crash tests
+
+The `transfer` handler accepts `debitAccountId`, `creditAccountId`, and `amountCents`. Each account must exist in PostgreSQL. The demo records debit, credit, and receipt as three separate idempotent transactions. A receipt is a database row, representing a side effect within the same database.
+
+Run the crash harness from Linux or WSL with Docker Compose and Node 20. It creates disposable Compose projects with their own ports and volumes. Each scenario processes 10,000 acknowledged jobs using five recovery workers. The harness kills one worker immediately after a committed debit, then restarts or hard-kills that scenario’s Redis container during queue processing.
+
+```bash
+test -f .env || cp .env.example .env
+npm ci
+npm run build
+docker compose up -d --wait redis postgres
+npm run test:mutations
+npm run chaos -- graceful 20261115 10000
+npm run chaos -- hard 20261115 10000
+```
+
+Each run writes `acknowledged.ndjson`, `events.ndjson`, and `summary.json` under `chaos-results/`. A job counts as lost if enqueue was acknowledged but the run never observed completion. Completion requires a successful queue transition and a committed receipt. The hard-crash run reports losses for that run and always checks for duplicate side effects. The graceful run also asserts zero losses. [Crash test design](docs/DESIGN.md#crash-measurement)
+
 ## Limitations
 
 - Recovery runs only while at least one worker for the affected queue is online. When all workers stop, expired leases and due delayed jobs wait for a worker to resume maintenance.

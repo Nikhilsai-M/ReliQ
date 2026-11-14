@@ -59,13 +59,11 @@ export function createApp(
     if (services.redis === 'up' && services.postgres === 'up') {
       response.json({ status: 'ok', services });
     } else {
-      response
-        .status(503)
-        .json({
-          error: errorBody('UNHEALTHY', 'A dependency is unavailable', [
-            services,
-          ]),
-        });
+      response.status(503).json({
+        error: errorBody('UNHEALTHY', 'A dependency is unavailable', [
+          services,
+        ]),
+      });
     }
   });
 

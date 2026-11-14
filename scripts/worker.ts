@@ -5,6 +5,7 @@ import { DeadLetterArchive } from '../src/db/archive.js';
 import { Ledger } from '../src/db/ledger.js';
 import { createPostgresPool } from '../src/db/pool.js';
 import { sleep } from '../src/jobs/sleep.js';
+import { createTransferHandler } from '../src/jobs/transfer.js';
 import { Queue } from '../src/queue/queue.js';
 import { createRedis } from '../src/queue/redis.js';
 import { Worker } from '../src/worker/worker.js';
@@ -29,7 +30,10 @@ try {
       retryPolicies: config.JOB_RETRY_POLICIES,
       record: (event) => ledger.record(event),
     }),
-    new Map([['sleep', sleep]]),
+    new Map([
+      ['sleep', sleep],
+      ['transfer', createTransferHandler(pool)],
+    ]),
     {
       workerId,
       visibilityTimeoutMs: config.VISIBILITY_TIMEOUT_MS,
