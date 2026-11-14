@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { retryPolicies } from '../queue/retry-policy.js';
 
 const envSchema = z.object({
   REDIS_URL: z.url({ protocol: /^rediss?$/, hostname: /.+/ }),
@@ -6,6 +7,18 @@ const envSchema = z.object({
   LOG_LEVEL: z
     .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'])
     .default('info'),
+  JOB_RETRY_POLICIES: z
+    .string()
+    .transform((raw, ctx): unknown => {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        ctx.addIssue({ code: 'custom', message: 'Expected a JSON object' });
+        return z.NEVER;
+      }
+    })
+    .pipe(retryPolicies)
+    .prefault('{}'),
 });
 
 export type Config = z.infer<typeof envSchema>;

@@ -10,15 +10,15 @@ if tonumber(delayedScore) > now then
   return {'NOT_DUE'} -- Leave the job in delayed until its deadline.
 end -- Finish the eligibility check.
 
-local job = redis.call('HMGET', KEYS[1], 'status', 'readyScore') -- Read state and the original score together.
+local job = redis.call('HMGET', KEYS[1], 'status', 'readyScore', 'attempts') -- Read state, score and attempt count together.
 if not job[1] then
   return {'JOB_MISSING'} -- The delayed index points to a missing job or status.
 end -- Finish the existence check.
-if job[1] ~= 'delayed' or not tonumber(job[2]) or redis.call('ZSCORE', KEYS[3], ARGV[1]) then
+if job[1] ~= 'delayed' or not tonumber(job[2]) or not tonumber(job[3]) or redis.call('ZSCORE', KEYS[3], ARGV[1]) then
   return {'INCONSISTENT'} -- Validate state and the destination before any mutation.
 end -- Finish checking the transition preconditions.
 
 redis.call('ZADD', KEYS[3], job[2], ARGV[1]) -- Restore the original priority and enqueue-time ordering.
 redis.call('ZREM', KEYS[2], ARGV[1]) -- Remove delayed membership in the same transition.
 redis.call('HSET', KEYS[1], 'status', 'ready') -- Keep the hash consistent with the indexes.
-return {'PROMOTED'} -- Count this candidate once, even when promoters race.
+return {'PROMOTED', now, tonumber(job[3])} -- Return the transition for the ledger and count it once.

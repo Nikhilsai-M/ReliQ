@@ -34,4 +34,4 @@ local attempt = redis.call('HINCRBY', KEYS[1], 'attempts', 1) -- Count the attem
 redis.call('HSET', KEYS[1], 'status', 'in_flight', 'workerId', ARGV[2], 'claimId', ARGV[3]) -- Record the active claim.
 redis.call('ZADD', KEYS[3], string.format('%.0f', deadline), ARGV[1]) -- Index the lease for expiry scans.
 redis.call('ZREM', KEYS[2], ARGV[1]) -- Remove this job from ready before another script runs.
-return {'CLAIMED', job[2], job[3], job[4], attempt, maxAttempts, token, deadline} -- Return the job and lease details.
+return {'CLAIMED', job[2], job[3], job[4], attempt, maxAttempts, token, deadline, now} -- Return the job, lease details and claim time.

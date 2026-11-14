@@ -1,5 +1,5 @@
 -- KEYS: job hash, ready set, delayed set.
--- ARGV: job ID, type, JSON payload, priority, band offset, band width, attempt limit, schedule mode, schedule value.
+-- ARGV: job ID, type, JSON payload, priority, band offset, band width, attempt limit, schedule mode, schedule value, base delay, max delay, jitter.
 -- The same ID cannot create an additional job, even if the original was already acknowledged.
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return {'JOB_EXISTS'} -- Leave the original job untouched.
@@ -39,6 +39,7 @@ end -- Finish selecting the state and index.
 redis.call('HSET', KEYS[1],
   'type', ARGV[2], 'payload', ARGV[3], 'priority', ARGV[4], -- Immutable job contents.
   'enqueuedAt', string.format('%.0f', now), 'runAt', runAtText, 'readyScore', readyScore, -- Scheduling metadata.
+  'baseDelayMs', ARGV[10], 'maxDelayMs', ARGV[11], 'jitterMs', ARGV[12], -- Snapshot the configured retry policy.
   'status', status, 'attempts', '0', 'maxAttempts', ARGV[7], -- Initial execution state.
   'fencingToken', '0', 'replayCount', '0') -- Counters start at zero.
 redis.call('ZADD', destination, score, ARGV[1]) -- Index the new job under its ID.

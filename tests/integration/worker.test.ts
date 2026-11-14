@@ -22,7 +22,11 @@ beforeAll(() => redis.connect());
 afterAll(() => redis.disconnect());
 beforeEach(() => {
   name = `worker-test-${randomUUID()}`;
-  queue = new Queue(redis, name);
+  queue = new Queue(redis, name, {
+    retryPolicies: {
+      sleep: { maxAttempts: 3, baseDelayMs: 50, maxDelayMs: 500, jitterMs: 0 },
+    },
+  });
   keys = queueKeys(name);
   jobIds = [];
 });
@@ -133,6 +137,31 @@ it('signals an active handler when lease ownership is lost', async () => {
   }
 });
 
+it('fails a handler explicitly and retries before its original lease deadline', async () => {
+  const id = await enqueue(0);
+  let firstDeadline: number | undefined;
+  const instance = worker(async (job) => {
+    if (job.attempt === 1) {
+      firstDeadline = job.leaseDeadline;
+      throw new Error('retry me');
+    }
+  });
+  const running = instance.run();
+  try {
+    await expect.poll(() => status(id), { interval: 10 }).toBe('delayed');
+    expect(await redis.zscore(keys.inFlight, id)).toBeNull();
+    expect(await redis.hget(keys.job(id), 'lastError')).toBe('retry me');
+    const runAt = await redis.zscore(keys.delayed, id);
+    expect(runAt).not.toBeNull();
+    expect(Number(runAt)).toBeLessThan(firstDeadline ?? 0);
+    await expect.poll(() => status(id)).toBe('succeeded');
+    expect(await redis.hget(keys.job(id), 'attempts')).toBe('2');
+  } finally {
+    await instance.drain();
+    await running;
+  }
+});
+
 function startProcess(drainMs: number) {
   const child = spawn(process.execPath, ['dist/scripts/worker.js'], {
     env: {
@@ -208,6 +237,7 @@ it.skipIf(process.platform === 'win32')(
       await expect
         .poll(() => queue.reapExpired(), { timeout: 2_000 })
         .toEqual({ requeued: 1, dead: 0 });
+      await expect.poll(() => queue.promoteDue()).toBe(1);
       const claim = await queue.claim('replacement', 1_000);
       expect(claim).toMatchObject({ jobId: id, attempt: 2, fencingToken: '2' });
     } finally {

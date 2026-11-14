@@ -8,7 +8,35 @@ const env = {
 
 describe('configuration', () => {
   it('validates the connection URLs and supplies a default log level', () => {
-    expect(loadConfig(env)).toEqual({ ...env, LOG_LEVEL: 'info' });
+    expect(loadConfig(env)).toEqual({
+      ...env,
+      LOG_LEVEL: 'info',
+      JOB_RETRY_POLICIES: {},
+    });
+  });
+
+  it('loads retry policy overrides per job type and rejects invalid caps', () => {
+    const config = loadConfig({
+      ...env,
+      JOB_RETRY_POLICIES: '{"sleep":{"baseDelayMs":40,"maxDelayMs":500}}',
+    });
+    expect(config.JOB_RETRY_POLICIES).toEqual({
+      sleep: {
+        baseDelayMs: 40,
+        maxDelayMs: 500,
+        jitterMs: 250,
+        maxAttempts: 3,
+      },
+    });
+    expect(() =>
+      loadConfig({
+        ...env,
+        JOB_RETRY_POLICIES: '{"sleep":{"baseDelayMs":40,"maxDelayMs":20}}',
+      }),
+    ).toThrow(ConfigError);
+    expect(() => loadConfig({ ...env, JOB_RETRY_POLICIES: '{' })).toThrow(
+      ConfigError,
+    );
   });
 
   it('reports missing settings', () => {

@@ -5,13 +5,15 @@ import { QueueInvariantError } from './errors.js';
 
 type Script = { source: string; sha: string };
 
-function loadScript(name: string): Script {
-  const source = readFileSync(
-    new URL(`../lua/${name}.lua`, import.meta.url),
-    'utf8',
-  );
+function loadScript(name: string, prefix = ''): Script {
+  const source =
+    prefix +
+    readFileSync(new URL(`../lua/${name}.lua`, import.meta.url), 'utf8');
   return { source, sha: createHash('sha1').update(source).digest('hex') };
 }
+
+const retry =
+  readFileSync(new URL('../lua/retry.lua', import.meta.url), 'utf8') + '\n';
 
 export const scripts = {
   enqueue: loadScript('enqueue'),
@@ -19,7 +21,9 @@ export const scripts = {
   claim: loadScript('claim'),
   ack: loadScript('ack'),
   heartbeat: loadScript('heartbeat'),
-  reap: loadScript('reap'),
+  reap: loadScript('reap', retry),
+  fail: loadScript('fail', retry),
+  replay: loadScript('replay'),
 };
 
 export async function runScript(

@@ -105,26 +105,37 @@ export class Worker {
     );
     const { jobId, attempt } = job;
 
+    let outcome: { ok: true } | { ok: false; error: unknown };
     try {
       const handler = this.handlers.get(job.type);
       if (!handler) throw new Error(`No handler registered for ${job.type}`);
       await handler(job, signal);
-      // Finish any renewal before ack removes the lease that heartbeat checks.
+      outcome = { ok: true };
+    } catch (error) {
+      outcome = { ok: false, error };
+    } finally {
+      // Finish any in-flight renewal before the terminal transition releases ownership.
       stopHeartbeat.abort();
       await heartbeat;
-      if (!signal.aborted) {
+    }
+
+    if (signal.aborted) return;
+    try {
+      if (outcome.ok) {
         await this.queue.ack(job);
         this.logger.info({ jobId, attempt }, 'Job acknowledged');
+      } else {
+        const transition = await this.queue.fail(job, outcome.error);
+        this.logger.warn(
+          { err: outcome.error, jobId, attempt, ...transition },
+          'Job failed',
+        );
       }
     } catch (err) {
-      // Phase 4 will add explicit failure reporting. For now the lease expires and the reaper recovers it.
       this.logger.warn(
-        { err, jobId, attempt },
-        'Job ended without acknowledgment',
+        { err, jobId, attempt, operation: outcome.ok ? 'ack' : 'fail' },
+        'Job transition could not be confirmed',
       );
-    } finally {
-      stopHeartbeat.abort();
-      await heartbeat;
     }
   }
 

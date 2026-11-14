@@ -69,6 +69,7 @@ describe('PostgreSQL migrations', () => {
     expect(results).toContainEqual([
       '001_queue_history.sql',
       '002_idempotency_demo.sql',
+      '003_preserve_archive_json.sql',
     ]);
     expect(results).toContainEqual([]);
     expect(await migrate(pool, migrationsDirectory)).toEqual([]);
@@ -101,9 +102,13 @@ describe('PostgreSQL migrations', () => {
     if (!pool) throw new Error('Test schema was not initialized');
     await migrate(pool, migrationsDirectory);
     const directory = await mkdtemp(join(tmpdir(), 'reliq-migrations-'));
-    const history = ['001_queue_history.sql', '002_idempotency_demo.sql'];
-    const probe = '003_probe.sql';
-    const fails = '004_fails.sql';
+    const history = [
+      '001_queue_history.sql',
+      '002_idempotency_demo.sql',
+      '003_preserve_archive_json.sql',
+    ];
+    const probe = '004_probe.sql';
+    const fails = '005_fails.sql';
     try {
       for (const name of history) {
         await copyFile(join(migrationsDirectory, name), join(directory, name));

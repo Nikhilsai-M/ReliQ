@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import {
   afterAll,
   afterEach,
@@ -16,6 +17,7 @@ import {
   JobExistsError,
   JobNotFoundError,
   QueueInvariantError,
+  ReplayConflictError,
 } from '../../src/queue/errors.js';
 import { queueKeys } from '../../src/queue/keys.js';
 import { readyScore } from '../../src/queue/priority.js';
@@ -41,7 +43,9 @@ async function redisTime() {
 }
 
 async function waitUntil(timestamp: number) {
-  await expect.poll(() => redisTime()).toBeGreaterThanOrEqual(timestamp);
+  await expect
+    .poll(() => redisTime(), { timeout: 2_500 })
+    .toBeGreaterThanOrEqual(timestamp);
 }
 
 async function claimOne() {
@@ -187,7 +191,7 @@ describe('promoteDue', () => {
     const scriptKeys = [keys.job(older.id), keys.delayed, keys.ready];
     expect(
       await runScript(redis, scripts.promoteDue, scriptKeys, [older.id]),
-    ).toEqual(['PROMOTED']);
+    ).toEqual(['PROMOTED', expect.any(Number), 0]);
     expect(
       await runScript(redis, scripts.promoteDue, scriptKeys, [older.id]),
     ).toEqual(['SKIPPED']);
@@ -405,8 +409,8 @@ describe('reap', () => {
     return runScript(
       redis,
       scripts.reap,
-      [keys.job(id), keys.inFlight, keys.ready, keys.dead, keys.dlqArchive],
-      [id, queueName],
+      [keys.job(id), keys.inFlight, keys.delayed, keys.dead, keys.dlqArchive],
+      [id, queueName, '0', '500', '30000', '250'],
     );
   }
 
@@ -453,6 +457,11 @@ describe('reap', () => {
     expect(results).toContainEqual({ requeued: 0, dead: 0 });
     expect(results).toContainEqual({ requeued: 1, dead: 0 });
     expect(await reapCandidate(enqueued.id)).toEqual(['SKIPPED']);
+    const runAt = await redis.zscore(keys.delayed, enqueued.id);
+    expect(Number(runAt)).toBeGreaterThanOrEqual(first.leaseDeadline + 1_000);
+    expect(await queue.claim('worker-2', leaseMs)).toBeNull();
+    await waitUntil(Number(runAt));
+    expect(await queue.promoteDue()).toBe(1);
     expect(await redis.zscore(keys.ready, enqueued.id)).toBe(
       String(readyScore('normal', enqueued.enqueuedAt)),
     );
@@ -509,5 +518,180 @@ describe('reap', () => {
     expect(await redis.zscore(keys.inFlight, id)).toBe('0');
     expect(await redis.zcard(keys.ready)).toBe(0);
     expect(await redis.zcard(keys.dead)).toBe(0);
+  });
+});
+
+describe('fail and replay', () => {
+  it('calculates exact backoff and jitter boundaries without mutating Redis state', async () => {
+    const source = await readFile(
+      new URL('../../src/lua/retry.lua', import.meta.url),
+      'utf8',
+    );
+    const result = await redis.eval(
+      `${source}\nreturn {retryDelay(1, 50, 500, 19, 0),
+      retryDelay(1, 50, 500, 19, 0.999), retryDelay(2, 50, 500, 0, 0.5),
+      retryDelay(3, 50, 410, 19, 0.999), retryDelay(2147483647, 50, 500, 19, 0.999)}`,
+      0,
+    );
+    expect(result).toEqual([100, 119, 200, 410, 500]);
+  });
+
+  it('supplies default timing for a pre-Phase 4 hash while preserving its attempt budget', async () => {
+    const { id } = await queue.enqueue({ ...job, maxAttempts: 2 });
+    await redis.hdel(keys.job(id), 'baseDelayMs', 'maxDelayMs', 'jitterMs');
+    const claim = await claimOne();
+    const consumer = new Queue(redis, queueName, { random: () => 0 });
+    const before = await redisTime();
+    expect(claim.maxAttempts).toBe(2);
+    const result = await consumer.fail(claim, 'legacy job');
+    if (result.status !== 'delayed') throw new Error('Expected a retry');
+    expect(result.runAt).toBeGreaterThanOrEqual(before + 1_000);
+    expect(result.runAt).toBeLessThanOrEqual((await redisTime()) + 1_000);
+  });
+  it('uses the saved per-type exponential backoff, jitter and cap before archiving exhaustion', async () => {
+    const producer = new Queue(redis, queueName, {
+      retryPolicies: {
+        test: {
+          maxAttempts: 3,
+          baseDelayMs: 30,
+          maxDelayMs: 100,
+          jitterMs: 19,
+        },
+      },
+    });
+    const consumer = new Queue(redis, queueName, { random: () => 0.5 });
+    const { id } = await producer.enqueue(job);
+    for (const [attempt, delay] of [
+      [1, 70],
+      [2, 100],
+    ] as const) {
+      const claim = await consumer.claim('worker-1', leaseMs);
+      if (!claim) throw new Error('Expected a claim');
+      expect(claim).toMatchObject({ jobId: id, attempt, maxAttempts: 3 });
+      const before = await redisTime();
+      const result = await consumer.fail(claim, new Error('retry me'));
+      expect(result.status).toBe('delayed');
+      if (result.status !== 'delayed') throw new Error('Expected a retry');
+      expect(result.runAt).toBeGreaterThanOrEqual(before + delay);
+      expect(result.runAt).toBeLessThanOrEqual((await redisTime()) + delay);
+      expect(await redis.zscore(keys.inFlight, id)).toBeNull();
+      await expect(consumer.fail(claim, 'duplicate')).rejects.toBeInstanceOf(
+        InvalidClaimError,
+      );
+      await waitUntil(result.runAt);
+      expect(await consumer.promoteDue()).toBe(1);
+    }
+
+    const claim = await claimOne();
+    const error = new Error('permanent failure');
+    expect(await consumer.fail(claim, error)).toEqual({ status: 'dead' });
+    await expect(consumer.fail(claim, error)).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    expect(await redis.xlen(keys.dlqArchive)).toBe(1);
+    expect(await consumer.listDead()).toEqual([
+      {
+        id,
+        type: job.type,
+        status: 'dead',
+        attempts: 3,
+        lastError: error.message,
+        stack: error.stack,
+        payload: job.payload,
+        replayCount: 0,
+        deadAt: expect.any(Number),
+      },
+    ]);
+  });
+
+  it('rejects missing jobs, wrong credentials and expired owners on fail', async () => {
+    const { id } = await queue.enqueue(job);
+    const claim = await queue.claim('worker-1', 200);
+    if (!claim) throw new Error('Expected a claim');
+    await expect(
+      queue.fail({ ...claim, jobId: randomUUID() }, 'missing'),
+    ).rejects.toBeInstanceOf(JobNotFoundError);
+    await expect(
+      queue.fail({ ...claim, fencingToken: '2' }, 'stale'),
+    ).rejects.toBeInstanceOf(InvalidClaimError);
+    await expect(
+      queue.fail({ ...claim, claimId: randomUUID() }, 'stale'),
+    ).rejects.toBeInstanceOf(InvalidClaimError);
+    await waitUntil(claim.leaseDeadline);
+    await expect(queue.fail(claim, 'expired')).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    expect(await redis.hget(keys.job(id), 'status')).toBe('in_flight');
+    expect(await redis.zcard(keys.delayed)).toBe(0);
+    expect(await redis.xlen(keys.dlqArchive)).toBe(0);
+  });
+
+  it('replays once per dead generation and preserves fencing across repeated exhaustion', async () => {
+    const { id } = await queue.enqueue({ ...job, maxAttempts: 1 });
+    await expect(queue.replay({ id, replayCount: 0 })).rejects.toBeInstanceOf(
+      ReplayConflictError,
+    );
+    const first = await claimOne();
+    await queue.fail(first, 'first');
+    const schedule = { id, replayCount: 0 };
+    const races = await Promise.allSettled([
+      queue.replay(schedule),
+      queue.replay(schedule),
+    ]);
+    expect(races.filter((result) => result.status === 'fulfilled')).toEqual([
+      { status: 'fulfilled', value: { id, replayCount: 1 } },
+    ]);
+    expect(races.filter((result) => result.status === 'rejected')).toEqual([
+      { status: 'rejected', reason: expect.any(ReplayConflictError) },
+    ]);
+    expect(await queue.listDead()).toEqual([]);
+    expect(
+      await redis.hmget(
+        keys.job(id),
+        'status',
+        'attempts',
+        'lastError',
+        'fencingToken',
+      ),
+    ).toEqual(['ready', '0', null, '1']);
+    const second = await claimOne();
+    expect(second).toMatchObject({ jobId: id, attempt: 1, fencingToken: '2' });
+    await expect(queue.fail(first, 'zombie')).rejects.toBeInstanceOf(
+      InvalidClaimError,
+    );
+    await queue.fail(second, 'second');
+    await expect(queue.replay(schedule)).rejects.toBeInstanceOf(
+      ReplayConflictError,
+    );
+    expect(await queue.listDead()).toMatchObject([
+      { id, replayCount: 1, lastError: 'second' },
+    ]);
+    expect(await redis.xlen(keys.dlqArchive)).toBe(3);
+  });
+
+  it('returns mixed bulk outcomes and rejects missing jobs individually', async () => {
+    const missing = randomUUID();
+    await expect(
+      queue.replay({ id: missing, replayCount: 0 }),
+    ).rejects.toBeInstanceOf(JobNotFoundError);
+    const first = await queue.enqueue({ ...job, maxAttempts: 1 });
+    await queue.fail(await claimOne(), 'failed');
+    const second = await queue.enqueue({ ...job, maxAttempts: 1 });
+    await queue.fail(await claimOne(), 'failed');
+    const page = await queue.listDead(0, 1);
+    expect(page).toHaveLength(1);
+    expect((await queue.listDead(1, 1))[0]?.id).not.toBe(page[0]?.id);
+    const results = await queue.replayMany([
+      { id: first.id, replayCount: 0 },
+      { id: missing, replayCount: 0 },
+      { id: second.id, replayCount: 0 },
+    ]);
+    expect(results).toEqual([
+      { id: first.id, replayCount: 1, status: 'replayed' },
+      { id: missing, status: 'failed', error: expect.any(JobNotFoundError) },
+      { id: second.id, replayCount: 1, status: 'replayed' },
+    ]);
+    expect(await redis.zcard(keys.ready)).toBe(2);
+    expect(await queue.listDead()).toEqual([]);
   });
 });

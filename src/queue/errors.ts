@@ -25,3 +25,12 @@ export class QueueInvariantError extends Error {
     this.name = 'QueueInvariantError';
   }
 }
+
+export class ReplayConflictError extends Error {
+  constructor(readonly jobId: string) {
+    super(
+      `Job no longer matches the selected dead-letter generation: ${jobId}`,
+    );
+    this.name = 'ReplayConflictError';
+  }
+}

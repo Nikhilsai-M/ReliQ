@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { priorities } from './priority.js';
+import { maxAttemptCount as attemptCount } from './retry-policy.js';
 
 const jobId = z.uuid();
-const timestamp = z.int().nonnegative();
+export const timestamp = z.int().nonnegative();
 const workerId = z.string().min(1);
 export const queueName = z.string().regex(/^[A-Za-z0-9_-]+$/);
-const attemptCount = z.int().positive().max(2_147_483_647);
 const fencingToken = z.string().regex(/^[1-9][0-9]*$/);
 
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
@@ -31,7 +31,7 @@ const job = z.object({
   type: z.string().min(1),
   payload: jsonPayload,
   priority: z.enum(priorities).default('normal'),
-  maxAttempts: attemptCount.default(3),
+  maxAttempts: attemptCount.optional(),
 });
 
 export const enqueueInput = z.union([
@@ -54,7 +54,41 @@ export const claimCredential = z.object({
 export type ClaimCredential = z.infer<typeof claimCredential>;
 
 export const promoteLimit = z.int().min(1).max(1_000);
+export const replaySelection = z.object({
+  id: jobId,
+  replayCount: z.int().nonnegative().max(2_147_483_647),
+});
+export const dlqEntry = z.object({
+  type: z.string(),
+  payload: z.string(),
+  lastError: z.string(),
+  stack: z.string().optional(),
+  attempts: z.coerce.number().pipe(attemptCount),
+  deadAt: z.coerce.number().pipe(timestamp),
+  replayCount: z.coerce.number().pipe(replaySelection.shape.replayCount),
+  status: z.literal('dead'),
+});
 export const heartbeatReply = z.tuple([z.literal('EXTENDED'), timestamp]);
+export const promoteReply = z.tuple([
+  z.literal('PROMOTED'),
+  timestamp,
+  timestamp,
+]);
+export const ackReply = z.tuple([z.literal('ACKED'), timestamp, attemptCount]);
+export const failureReply = z.tuple([
+  z.literal('FAILED'),
+  z.enum(['delayed', 'dead']),
+  timestamp,
+  timestamp,
+  attemptCount,
+  workerId,
+]);
+export const replayReply = z.tuple([
+  z.literal('REPLAYED'),
+  timestamp,
+  timestamp,
+  attemptCount,
+]);
 
 export const enqueueReply = z.tuple([
   z.literal('ENQUEUED'),
@@ -71,5 +105,6 @@ export const claimReply = z.tuple([
   attemptCount,
   attemptCount,
   fencingToken,
+  timestamp,
   timestamp,
 ]);
