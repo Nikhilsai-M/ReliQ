@@ -1,0 +1,35 @@
+{
+  "name": "reliq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || ^24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run tests/unit",
+    "test:integration": "node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration",
+    "db:migrate": "node --env-file=.env dist/scripts/migrate.js",
+    "infra:check": "node --env-file=.env dist/scripts/check-connections.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.6.0",
+    "pg": "^8.15.0",
+    "pino": "^9.6.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/pg": "^8.15.0",
+    "eslint": "10.15.0",
+    "prettier": "^3.6.0",
+    "typescript": "~5.9.0",
+    "typescript-eslint": "~8.56.0",
+    "vitest": "^3.2.0"
+  }
+}
