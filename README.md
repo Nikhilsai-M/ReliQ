@@ -2,6 +2,22 @@
 
 ReliQ is a Redis-backed job queue with lease recovery and a PostgreSQL dead-letter archive. See [the design](docs/DESIGN.md) for the state machine and durability guarantees.
 
+```mermaid
+flowchart LR
+    Operator[CLI or HTTP client] --> API[Express API]
+    API --> Redis[(Redis live queue and AOF)]
+    Redis --> Worker[Workers claim and heartbeat]
+    Worker --> Redis
+    Worker --> Maintenance[Promote due jobs and reap expired leases]
+    Maintenance --> Redis
+    API --> Ledger[Bounded audit buffer]
+    Worker --> Ledger
+    Ledger --> PG[(PostgreSQL)]
+    Redis --> Archive[Background archive writer]
+    Archive --> PG
+    Worker --> PG
+```
+
 ## Local API and CLI
 
 Use Node 20.19 or later in the Node 20 series and Docker Compose.
@@ -63,9 +79,25 @@ npm run test:idempotency-mutation -- 20261115 100
 
 Each run writes one small `summary.json` under `chaos-results/`. Git ignores the larger acknowledgment, attempt, and event journals. A job counts as lost if enqueue was acknowledged but the run never observed completion. Completion requires a successful queue transition and a committed receipt. The graceful scenarios assert zero losses. All scenarios check for duplicate side effects. [Crash test design](docs/DESIGN.md#crash-measurement)
 
+## Benchmarks
+
+The benchmark compares the queue runtime with a fixed 5 ms `sleep` handler. It uses fresh Redis queues and prestarted workers. From the repository root after build and Compose startup:
+
+```bash
+for trial in 1 2 3; do
+  for workers in 1 2 5 10; do
+    npm run benchmark -- "$workers" 2000
+    sleep 1
+  done
+done
+```
+
+See [measured results and machine specs](docs/BENCHMARK.md). The harness measures enqueue-to-ack latency with the Redis clock and throughput with the producer's monotonic clock. See [the design](docs/DESIGN.md#durability-and-reconciliation) for the trade-offs between lease ownership, retry behavior, and Redis durability.
+
 ## Limitations
 
 - Recovery runs only while at least one worker for the affected queue is online. When all workers stop, expired leases and due delayed jobs wait for a worker to resume maintenance.
 - The operator API has no authentication and is for localhost use only. Compose publishes the port on `127.0.0.1`. Depth covers the four indexed live states. Succeeded jobs retain a terminal hash.
 - Purge keeps a permanent Redis ID reservation. These reservations grow without bound. One option is a bounded deduplication window with expiring reservations and server-assigned, non-reusable IDs so an expired reservation cannot let an old ID collide with archive or idempotency history.
 - DLQ and in-flight pages can shift when other clients change the queue between reads.
+- Redis AOF with `everysec` can lose recent acknowledged writes on a host or storage failure. Worker leases protect queue transitions. Handler side effects require their own idempotency or fencing.
