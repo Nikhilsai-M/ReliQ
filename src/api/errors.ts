@@ -7,49 +7,63 @@ import {
   JobNotFoundError,
 } from '../queue/errors.js';
 
+export function errorBody(
+  code: string,
+  message: string,
+  details: unknown[] = [],
+) {
+  return { code, message, details };
+}
+
+export class QueueNotFoundError extends Error {
+  constructor(name: string) {
+    super(`Queue not found: ${name}`);
+    this.name = 'QueueNotFoundError';
+  }
+}
+
 export function describeError(error: unknown) {
   if (error instanceof URIError) {
     return {
       status: 400,
-      body: {
-        code: 'VALIDATION_ERROR',
-        message: 'Invalid request path encoding',
-      },
+      body: errorBody('VALIDATION_ERROR', 'Invalid request path encoding'),
     };
   }
   if (error instanceof ZodError) {
     return {
       status: 400,
-      body: {
-        code: 'VALIDATION_ERROR',
-        message: 'Invalid request',
-        details: error.issues.map(({ path, message }) => ({ path, message })),
-      },
+      body: errorBody(
+        'VALIDATION_ERROR',
+        'Invalid request',
+        error.issues.map(({ path, message }) => ({ path, message })),
+      ),
     };
   }
+  if (error instanceof QueueNotFoundError)
+    return { status: 404, body: errorBody('QUEUE_NOT_FOUND', error.message) };
   if (error instanceof JobNotFoundError)
     return {
       status: 404,
-      body: { code: 'JOB_NOT_FOUND', message: error.message },
+      body: errorBody('JOB_NOT_FOUND', error.message),
     };
   if (error instanceof JobExistsError)
     return {
       status: 409,
-      body: { code: 'JOB_EXISTS', message: error.message },
+      body: errorBody('JOB_EXISTS', error.message),
     };
   if (error instanceof DeadGenerationConflictError)
     return {
       status: 409,
-      body: { code: 'DEAD_GENERATION_CONFLICT', message: error.message },
+      body: errorBody('DEAD_GENERATION_CONFLICT', error.message),
     };
   if (error instanceof RangeError)
     return {
       status: 400,
-      body: { code: 'VALIDATION_ERROR', message: error.message },
+      body: errorBody('VALIDATION_ERROR', error.message),
     };
   return {
     status: 500,
-    body: { code: 'INTERNAL_ERROR', message: 'Queue operation failed' },
+    body: errorBody('INTERNAL_ERROR', 'Queue operation failed'),
   };
 }
 
@@ -60,24 +74,18 @@ export function handleErrors(logger: Logger): ErrorRequestHandler {
       error instanceof Error && 'type' in error ? error.type : undefined;
     if (parseError === 'entity.parse.failed') {
       response.status(400).json({
-        error: { code: 'INVALID_JSON', message: 'Malformed JSON body' },
+        error: errorBody('INVALID_JSON', 'Malformed JSON body'),
       });
     } else if (parseError === 'entity.too.large') {
       response.status(413).json({
-        error: {
-          code: 'BODY_TOO_LARGE',
-          message: 'JSON body exceeds 256 KiB',
-        },
+        error: errorBody('BODY_TOO_LARGE', 'JSON body exceeds 256 KiB'),
       });
     } else if (
       parseError === 'charset.unsupported' ||
       parseError === 'encoding.unsupported'
     ) {
       response.status(415).json({
-        error: {
-          code: 'UNSUPPORTED_MEDIA_TYPE',
-          message: 'Unsupported JSON encoding',
-        },
+        error: errorBody('UNSUPPORTED_MEDIA_TYPE', 'Unsupported JSON encoding'),
       });
     } else {
       const { status, body } = describeError(error);

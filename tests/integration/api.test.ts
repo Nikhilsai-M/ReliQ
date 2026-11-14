@@ -8,17 +8,26 @@ import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
 import { z } from 'zod';
 import { createApp } from '../../src/api/app.js';
+import { createHealthCheck } from '../../src/api/health.js';
 import { loadConfig } from '../../src/config/env.js';
 import { createLogger } from '../../src/config/logger.js';
+import { createPostgresPool } from '../../src/db/pool.js';
 import { queueKeys } from '../../src/queue/keys.js';
 import { Queue } from '../../src/queue/queue.js';
 import { createRedis } from '../../src/queue/redis.js';
 import { runScript, scripts } from '../../src/queue/scripts.js';
 
 const logger = createLogger('silent');
-const redis = createRedis(loadConfig().REDIS_URL, logger);
+const config = loadConfig();
+const redis = createRedis(config.REDIS_URL, logger);
+const pool = createPostgresPool(config.DATABASE_URL, logger);
+const healthRedis = createRedis(config.REDIS_URL, logger);
 const server = createServer(
-  createApp((name) => new Queue(redis, name), logger),
+  createApp(
+    (requested) => (requested === name ? queue : undefined),
+    logger,
+    createHealthCheck(healthRedis, pool),
+  ),
 );
 const exec = promisify(execFile);
 let base: string;
@@ -28,7 +37,7 @@ let keys: ReturnType<typeof queueKeys>;
 const jobId = z.object({ id: z.uuid() });
 
 beforeAll(async () => {
-  await redis.connect();
+  await Promise.all([redis.connect(), healthRedis.connect()]);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string')
@@ -37,7 +46,9 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   redis.disconnect();
+  healthRedis.disconnect();
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  await pool.end();
 });
 beforeEach(() => {
   name = `api-${randomUUID()}`;
@@ -71,10 +82,46 @@ function request(path: string, method = 'GET', body?: unknown) {
 
 async function rejected(response: Response, status: number, code: string) {
   expect(response.status).toBe(status);
-  expect(await response.json()).toMatchObject({
-    error: { code, message: expect.any(String) },
+  expect(await response.json()).toEqual({
+    error: { code, message: expect.any(String), details: expect.any(Array) },
   });
 }
+
+it('reports live Redis and PostgreSQL readiness and returns 503 when Redis disconnects', async () => {
+  const response = await fetch(`${base}/health`);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    status: 'ok',
+    services: { redis: 'up', postgres: 'up' },
+  });
+  healthRedis.disconnect();
+  try {
+    const unavailable = await fetch(`${base}/health`);
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      error: {
+        code: 'UNHEALTHY',
+        message: expect.any(String),
+        details: [{ redis: 'down', postgres: 'up' }],
+      },
+    });
+  } finally {
+    await healthRedis.connect();
+  }
+});
+
+it('returns 404 for an unknown queue and for a missing replay target', async () => {
+  await rejected(
+    await fetch(`${base}/queues/unknown/stats`),
+    404,
+    'QUEUE_NOT_FOUND',
+  );
+  await rejected(
+    await request(`/dlq/${randomUUID()}/replay`, 'POST', { replayCount: 0 }),
+    404,
+    'JOB_NOT_FOUND',
+  );
+});
 
 async function deadJob() {
   const { id } = await queue.enqueue({

@@ -1,4 +1,32 @@
 services:
+  api:
+    profiles: [api]
+    build: .
+    environment:
+      API_HOST: 0.0.0.0
+      API_QUEUES: ${API_QUEUES:-default}
+      JOB_RETRY_POLICIES: '${JOB_RETRY_POLICIES:-}'
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://reliq:reliq@postgres:5432/reliq
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:${API_PORT:-3000}:3000'
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:3000/health').then(r => { if (!r.ok) process.exitCode = 1 }).catch(() => { process.exitCode = 1 })",
+        ]
+      interval: 5s
+      timeout: 8s
+      retries: 6
+
   redis:
     image: redis:7.4-alpine
     command: [redis-server, '--appendonly', 'yes', '--appendfsync', everysec]

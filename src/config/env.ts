@@ -11,7 +11,7 @@ const envSchema = z.object({
     .string()
     .transform((raw, ctx): unknown => {
       try {
-        return JSON.parse(raw);
+        return JSON.parse(raw || '{}');
       } catch {
         ctx.addIssue({ code: 'custom', message: 'Expected a JSON object' });
         return z.NEVER;

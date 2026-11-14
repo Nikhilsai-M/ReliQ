@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { createApp } from '../src/api/app.js';
+import { createHealthCheck } from '../src/api/health.js';
 import { loadApiConfig } from '../src/config/api.js';
 import { createLogger } from '../src/config/logger.js';
 import { Ledger } from '../src/db/ledger.js';
@@ -16,13 +17,19 @@ try {
     queryTimeoutMs: 5_000,
   });
   const ledger = new Ledger(pool, logger);
-  const app = createApp(
-    (name) =>
+  const queues = new Map(
+    config.API_QUEUES.map((name) => [
+      name,
       new Queue(redis, name, {
         retryPolicies: config.JOB_RETRY_POLICIES,
         record: (event) => ledger.record(event),
       }),
+    ]),
+  );
+  const app = createApp(
+    (name) => queues.get(name),
     logger,
+    createHealthCheck(redis, pool),
   );
   const server = createServer(app);
   const stop = new AbortController();
@@ -37,7 +44,7 @@ try {
     process.once('SIGTERM', shutdown);
     process.once('SIGINT', shutdown);
     writing = ledger.run(stop.signal);
-    server.listen(config.API_PORT, '127.0.0.1', () => {
+    server.listen(config.API_PORT, config.API_HOST, () => {
       logger.info({ port: config.API_PORT }, 'Queue API listening');
     });
     await Promise.race([closed, writing]);

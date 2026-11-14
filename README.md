@@ -15,6 +15,8 @@ npm run db:migrate
 npm run api
 ```
 
+To run the API in Compose, use `docker compose --profile api up -d --build --wait` in place of the host API command. Compose probes `GET /health`, which returns `200` when Redis and PostgreSQL respond and `503` otherwise. Set `API_QUEUES` to a comma-separated list of API-visible queues. The default is `default`.
+
 In a second terminal, run `npm run worker` to consume jobs in `QUEUE_NAME`. In another terminal, try the CLI against the API:
 
 ```bash
@@ -37,10 +39,11 @@ Every route starts with `/queues/:queue`. Send mutation bodies as `application/j
 | `POST /dlq/replay`     | `{ "jobs": [{ "id": "<uuid>", "replayCount": 0 }] }`                                         | `200` with one result per selection                            |
 | `DELETE /dlq/:id`      | `{ "replayCount": 0 }`                                                                       | `204`                                                          |
 
-Use the ID and `replayCount` returned by DLQ inspection for replay or purge. Run `npm run cli -- --help` for those CLI commands. Single-operation errors use `{ "error": { "code": "…", "message": "…" } }`. Bulk replay returns errors on individual results, and the CLI exits nonzero when any item fails.
+Use the ID and `replayCount` returned by DLQ inspection for replay or purge. Run `npm run cli -- --help` for those CLI commands. Single-operation errors use `{ "error": { "code": "…", "message": "…", "details": [] } }`. Bulk replay returns the same error fields on individual results, and the CLI exits nonzero when any item fails.
 
 ## Limitations
 
 - Recovery runs only while at least one worker for the affected queue is online. When all workers stop, expired leases and due delayed jobs wait for a worker to resume maintenance.
-- The operator API binds to `127.0.0.1` and has no authentication. Depth covers the four indexed live states. Succeeded jobs retain a terminal hash.
-- Purge removes the live dead-letter entry and retains its archive and a Redis ID reservation. DLQ and in-flight pages can shift when other clients change the queue between reads.
+- The operator API has no authentication and is for localhost use only. Compose publishes the port on `127.0.0.1`. Depth covers the four indexed live states. Succeeded jobs retain a terminal hash.
+- Purge keeps a permanent Redis ID reservation. These reservations grow without bound. One option is a bounded deduplication window with expiring reservations and server-assigned, non-reusable IDs so an expired reservation cannot let an old ID collide with archive or idempotency history.
+- DLQ and in-flight pages can shift when other clients change the queue between reads.

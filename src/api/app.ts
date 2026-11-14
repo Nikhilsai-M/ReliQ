@@ -9,7 +9,13 @@ import {
   replaySelection,
   timestamp,
 } from '../queue/schemas.js';
-import { describeError, handleErrors } from './errors.js';
+import {
+  describeError,
+  errorBody,
+  handleErrors,
+  QueueNotFoundError,
+} from './errors.js';
+import type { createHealthCheck } from './health.js';
 
 const pagination = z
   .object({
@@ -32,11 +38,36 @@ const bulk = z
   .object({ jobs: z.array(replaySelection.strict()).min(1).max(100) })
   .strict();
 
-export function createApp(getQueue: (name: string) => Queue, logger: Logger) {
+export function createApp(
+  getQueue: (name: string) => Queue | undefined,
+  logger: Logger,
+  health: ReturnType<typeof createHealthCheck>,
+) {
   const app = express();
   app.disable('x-powered-by');
   const queues = express.Router();
-  const readQueue = (name: unknown) => getQueue(queueName.parse(name));
+  const readQueue = (value: unknown) => {
+    const name = queueName.parse(value);
+    const queue = getQueue(name);
+    if (!queue) throw new QueueNotFoundError(name);
+    return queue;
+  };
+
+  app.get('/health', async (_request, response) => {
+    response.set('Cache-Control', 'no-store');
+    const services = await health();
+    if (services.redis === 'up' && services.postgres === 'up') {
+      response.json({ status: 'ok', services });
+    } else {
+      response
+        .status(503)
+        .json({
+          error: errorBody('UNHEALTHY', 'A dependency is unavailable', [
+            services,
+          ]),
+        });
+    }
+  });
 
   queues.use((_request, response, next) => {
     response.set('Cache-Control', 'no-store');
@@ -68,10 +99,7 @@ export function createApp(getQueue: (name: string) => Queue, logger: Logger) {
         !request.is('application/json')
       ) {
         response.status(415).json({
-          error: {
-            code: 'UNSUPPORTED_MEDIA_TYPE',
-            message: 'Use application/json',
-          },
+          error: errorBody('UNSUPPORTED_MEDIA_TYPE', 'Use application/json'),
         });
         return;
       }
@@ -126,7 +154,7 @@ export function createApp(getQueue: (name: string) => Queue, logger: Logger) {
   app.use((_request, response) => {
     response
       .status(404)
-      .json({ error: { code: 'ROUTE_NOT_FOUND', message: 'Route not found' } });
+      .json({ error: errorBody('ROUTE_NOT_FOUND', 'Route not found') });
   });
   app.use(handleErrors(logger));
   return app;
