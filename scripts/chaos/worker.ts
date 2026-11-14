@@ -3,7 +3,7 @@ import { loadConfig } from '../../src/config/env.js';
 import { createLogger } from '../../src/config/logger.js';
 import { createPostgresPool } from '../../src/db/pool.js';
 import { createTransferHandler } from '../../src/jobs/transfer.js';
-import { Queue } from '../../src/queue/queue.js';
+import { Queue, type ClaimCredential } from '../../src/queue/queue.js';
 import { createRedis } from '../../src/queue/redis.js';
 import { Worker } from '../../src/worker/worker.js';
 
@@ -16,21 +16,39 @@ const redis = createRedis(config.REDIS_URL, logger);
 const pool = createPostgresPool(config.DATABASE_URL, logger, {
   queryTimeoutMs: 5_000,
 });
-const handler = createTransferHandler(pool, async (job, signal) => {
-  if (job.jobId !== pauseId) return;
-  process.send?.({ event: 'debit_committed', jobId: job.jobId });
-  // The parent kills this process at the transaction boundary.
-  await setTimeout(300_000, undefined, { signal });
-});
-const queue = new Queue(redis, name, {
-  record(event) {
-    if (event.to === 'succeeded')
-      process.send?.({ event: 'completed', jobId: event.jobId });
+const transfer = createTransferHandler(
+  pool,
+  async (job, signal) => {
+    if (job.jobId !== pauseId) return;
+    process.send?.({ event: 'debit_committed', jobId: job.jobId });
+    // The parent kills this process at the transaction boundary.
+    await setTimeout(300_000, undefined, { signal });
   },
-});
+  (job) => {
+    process.send?.({
+      event: 'handler_started',
+      jobId: job.jobId,
+      claimId: job.claimId,
+      atMs: Date.now(),
+    });
+  },
+);
+class TracedQueue extends Queue {
+  override async ack(claim: ClaimCredential) {
+    const { jobId, claimId } = claim;
+    try {
+      await super.ack(claim);
+      process.send?.({ event: 'completed', jobId, claimId, atMs: Date.now() });
+    } catch (error) {
+      process.send?.({ event: 'ack_failed', jobId, claimId, atMs: Date.now() });
+      throw error;
+    }
+  }
+}
+const queue = new TracedQueue(redis, name);
 const worker = new Worker(
   queue,
-  new Map([['transfer', handler]]),
+  new Map([['transfer', transfer]]),
   {
     workerId,
     visibilityTimeoutMs: 2_000,

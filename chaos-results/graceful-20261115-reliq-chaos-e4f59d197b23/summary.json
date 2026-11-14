@@ -1,0 +1,24 @@
+{
+  "scenario": "graceful",
+  "seed": 20261115,
+  "workers": 5,
+  "acknowledged": 10000,
+  "completed": 10000,
+  "redisSucceeded": 10000,
+  "receipts": 10000,
+  "lost": 0,
+  "handler_executions": 10006,
+  "jobs_entered": 10000,
+  "side_effects": 30000,
+  "duplicated_effects": 0,
+  "debits": 10000,
+  "credits": 10000,
+  "receipt_effects": 10000,
+  "balances": {
+    "1be6a8e4-a04a-4922-b87a-a8437970f57a": 0,
+    "e1b62a4d-be86-406e-8c90-a9340ecefe7b": 10000
+  },
+  "duplicateHandlerExecutions": 6,
+  "drainReached": true,
+  "lostIds": []
+}

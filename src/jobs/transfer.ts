@@ -15,7 +15,7 @@ const transferPayload = z
   );
 
 type Step = 'debit' | 'credit' | 'receipt';
-type Effect = (client: PoolClient) => Promise<void>;
+type Effect = (client: PoolClient) => Promise<boolean | void>;
 
 async function applyStep(
   pool: Pool,
@@ -33,11 +33,12 @@ async function applyStep(
       [jobId, step],
     );
     if (inserted.rowCount === 1) {
-      await effect(client);
-      await client.query(
-        'INSERT INTO transfer_effects (job_id, step_key) VALUES ($1, $2)',
-        [jobId, step],
-      );
+      const applied = await effect(client);
+      if (applied !== false)
+        await client.query(
+          'INSERT INTO transfer_effects (job_id, step_key) VALUES ($1, $2)',
+          [jobId, step],
+        );
     }
     await client.query('COMMIT');
   } catch (error) {
@@ -55,6 +56,7 @@ async function applyStep(
 export function createTransferHandler(
   pool: Pool,
   afterDebit?: (job: ClaimedJob, signal: AbortSignal) => Promise<void>,
+  onExecutionRecorded?: (job: ClaimedJob) => void,
 ): Handler {
   return async (job, signal) => {
     const { jobId, workerId } = job;
@@ -63,19 +65,21 @@ export function createTransferHandler(
       'INSERT INTO transfer_executions (job_id, worker_id) VALUES ($1, $2)',
       [jobId, workerId],
     );
+    onExecutionRecorded?.(job);
     const { debitAccountId, creditAccountId, amountCents } =
       transferPayload.parse(job.payload);
     signal.throwIfAborted();
     await applyStep(pool, jobId, 'debit', async (client) => {
       await client.query(
         `INSERT INTO transfers (job_id, debit_account_id, credit_account_id, amount_cents)
-        VALUES ($1, $2, $3, $4)`,
+        VALUES ($1, $2, $3, $4) ON CONFLICT (job_id) DO NOTHING`,
         [jobId, debitAccountId, creditAccountId, amountCents],
       );
       const debit = await client.query(
-        `UPDATE accounts SET balance_cents = balance_cents - $1
-        WHERE id = $2 AND balance_cents >= $1`,
-        [amountCents, debitAccountId],
+        `UPDATE accounts AS account SET balance_cents = account.balance_cents - transfer.amount_cents
+        FROM transfers AS transfer WHERE transfer.job_id = $1 AND account.id = transfer.debit_account_id
+        AND account.balance_cents >= transfer.amount_cents`,
+        [jobId],
       );
       if (debit.rowCount !== 1) throw new Error('Insufficient funds');
     });
@@ -95,7 +99,11 @@ export function createTransferHandler(
 
     signal.throwIfAborted();
     await applyStep(pool, jobId, 'receipt', async (client) => {
-      await client.query('INSERT INTO receipts (job_id) VALUES ($1)', [jobId]);
+      const receipt = await client.query(
+        'INSERT INTO receipts (job_id) VALUES ($1) ON CONFLICT (job_id) DO NOTHING',
+        [jobId],
+      );
+      return receipt.rowCount === 1;
     });
   };
 }

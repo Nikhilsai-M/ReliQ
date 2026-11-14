@@ -1,0 +1,47 @@
+{
+  "scenario": "graceful",
+  "scenarioLabel": "Graceful Redis restart",
+  "seed": 20261115,
+  "workers": 5,
+  "acknowledged": 100,
+  "completed": 100,
+  "redisSucceeded": 100,
+  "receipts": 100,
+  "lost": 0,
+  "handler_executions": 105,
+  "jobs_entered": 100,
+  "side_effects": 300,
+  "duplicated_effects": 0,
+  "debits": 100,
+  "credits": 100,
+  "receipt_effects": 100,
+  "balances": {
+    "4791d789-9f51-46b0-9f2c-7de0efc1394e": 100,
+    "72bca077-d393-4bea-be4a-4bef35e9fa82": 100
+  },
+  "duplicateHandlerExecutions": 5,
+  "repeatCauses": {
+    "killedWorker": 1,
+    "failedAckDuringRedisRestart": 4,
+    "other": 0,
+    "unclassified": 0
+  },
+  "enqueueStats": {
+    "attempts": 100,
+    "failedAttempts": 0,
+    "retries": 0,
+    "jobsRetried": 0,
+    "reconciledReplies": 0
+  },
+  "timeline": {
+    "firstEnqueueMs": 3141,
+    "workerKillMs": 3362,
+    "redisCommandMs": 3724,
+    "redisReadyMs": 6287,
+    "lastEnqueueMs": 3724,
+    "acknowledgedBeforeRedis": 100,
+    "acknowledgedAtRedisReady": 100,
+    "finalAcknowledged": 100
+  },
+  "drainReached": true
+}

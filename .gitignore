@@ -1,7 +1,8 @@
 node_modules/
 dist/
 coverage/
-chaos-results/
+chaos-results/*/*
+!chaos-results/*/summary.json
 .env
 .env.*
 !.env.example

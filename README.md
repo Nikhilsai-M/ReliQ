@@ -55,9 +55,13 @@ docker compose up -d --wait redis postgres
 npm run test:mutations
 npm run chaos -- graceful 20261115 10000
 npm run chaos -- hard 20261115 10000
+npm run chaos -- continuous 20261115 10000
+npm run test:idempotency-mutation -- 20261115 100
 ```
 
-Each run writes `acknowledged.ndjson`, `events.ndjson`, and `summary.json` under `chaos-results/`. A job counts as lost if enqueue was acknowledged but the run never observed completion. Completion requires a successful queue transition and a committed receipt. The hard-crash run reports losses for that run and always checks for duplicate side effects. The graceful run also asserts zero losses. [Crash test design](docs/DESIGN.md#crash-measurement)
+`hard` runs the **Redis process SIGKILL** scenario. It does not simulate host power loss or fsync failure. `continuous` keeps sending jobs during a graceful Redis restart and counts failed attempts, retries, and replies reconciled by job ID.
+
+Each run writes one small `summary.json` under `chaos-results/`. Git ignores the larger acknowledgment, attempt, and event journals. A job counts as lost if enqueue was acknowledged but the run never observed completion. Completion requires a successful queue transition and a committed receipt. The graceful scenarios assert zero losses. All scenarios check for duplicate side effects. [Crash test design](docs/DESIGN.md#crash-measurement)
 
 ## Limitations
 

@@ -11,13 +11,15 @@ import { migrate } from '../../src/db/migrate.js';
 import { createPostgresPool } from '../../src/db/pool.js';
 import { queueKeys } from '../../src/queue/keys.js';
 import { Queue, type EnqueueInput } from '../../src/queue/queue.js';
+import { JobExistsError } from '../../src/queue/errors.js';
 import { createRedis } from '../../src/queue/redis.js';
 import { isolatedCompose } from './docker.js';
 import { measure } from './measure.js';
+import { classifyRepeats, workerMessage } from './trace.js';
 
 const [scenario, seed, total] = z
   .tuple([
-    z.enum(['graceful', 'hard']),
+    z.enum(['graceful', 'hard', 'continuous']),
     z.coerce.number().int().min(1).max(0xffff_ffff),
     z.coerce.number().int().min(10).max(100_000),
   ])
@@ -62,12 +64,34 @@ const children = new Set<ChildProcess>();
 const completed = new Set<string>();
 const acknowledged: string[] = [];
 const events: object[] = [];
+const trace: (Extract<z.infer<typeof workerMessage>, { claimId: string }> & {
+  workerId: string;
+})[] = [];
+const scenarioLabel =
+  scenario === 'hard'
+    ? 'Redis process SIGKILL'
+    : scenario === 'continuous'
+      ? 'Graceful Redis restart with continuous enqueues'
+      : 'Graceful Redis restart';
+const enqueueStats = {
+  attempts: 0,
+  failedAttempts: 0,
+  retries: 0,
+  jobsRetried: 0,
+  reconciledReplies: 0,
+};
+let firstEnqueueMs: number | undefined;
+let lastEnqueueMs: number | undefined;
+
+function elapsed() {
+  return Math.round(performance.now() - started);
+}
 
 function log(event: string, details: object = {}) {
   const entry = {
     event,
     at: new Date().toISOString(),
-    elapsedMs: Math.round(performance.now() - started),
+    elapsedMs: elapsed(),
     ...details,
   };
   events.push(entry);
@@ -83,12 +107,6 @@ function sample() {
   return (state >>> 0) / 0x1_0000_0000;
 }
 
-const message = z.discriminatedUnion('event', [
-  z.object({ event: z.literal('ready') }),
-  z.object({ event: z.literal('debit_committed'), jobId: z.uuid() }),
-  z.object({ event: z.literal('completed'), jobId: z.uuid() }),
-]);
-
 function launch(env: NodeJS.ProcessEnv, workerId: string, pauseId?: string) {
   const child = fork(
     'dist/scripts/chaos/worker.js',
@@ -102,11 +120,14 @@ function launch(env: NodeJS.ProcessEnv, workerId: string, pauseId?: string) {
   let ready = false;
   let debitCommitted = false;
   child.on('message', (raw) => {
-    const parsed = message.safeParse(raw);
+    const parsed = workerMessage.safeParse(raw);
     if (!parsed.success) return;
     if (parsed.data.event === 'ready') ready = true;
     else if (parsed.data.event === 'debit_committed') debitCommitted = true;
-    else completed.add(parsed.data.jobId);
+    else {
+      trace.push({ ...parsed.data, workerId });
+      if (parsed.data.event === 'completed') completed.add(parsed.data.jobId);
+    }
   });
   const exited = new Promise<void>((resolve, reject) => {
     child.once('error', reject);
@@ -158,6 +179,7 @@ await mkdir(output, { recursive: true });
 const journal = await open(join(output, 'acknowledged.ndjson'), 'wx');
 log('scenario_started', {
   scenario,
+  scenarioLabel,
   seed,
   requestedJobs: total,
   workers,
@@ -194,20 +216,45 @@ try {
   const destination = randomUUID();
   await pool.query(
     'INSERT INTO accounts (id, balance_cents) VALUES ($1, $3), ($2, 0)',
-    [source, destination, total],
+    [source, destination, total * 2],
   );
   const payload = {
     debitAccountId: source,
     creditAccountId: destination,
     amountCents: 1,
   };
-  async function enqueue(input: EnqueueInput) {
-    const job = await queue.enqueue(input);
-    acknowledged.push(job.id);
+  async function enqueue(input: EnqueueInput, retry = false) {
+    const id = randomUUID();
+    const until = performance.now() + 30_000;
+    let failures = 0;
+    let reconciled = false;
+    firstEnqueueMs ??= elapsed();
+    for (;;) {
+      enqueueStats.attempts++;
+      if (failures > 0) enqueueStats.retries++;
+      try {
+        await queue.enqueue({ ...input, id });
+        break;
+      } catch (error) {
+        // A retry using this generated ID can find the original committed write after a lost reply.
+        if (error instanceof JobExistsError && failures > 0) {
+          reconciled = true;
+          enqueueStats.reconciledReplies++;
+          break;
+        }
+        enqueueStats.failedAttempts++;
+        failures++;
+        if (!retry || performance.now() >= until) throw error;
+        await setTimeout(10);
+      }
+    }
+    if (failures > 0) enqueueStats.jobsRetried++;
+    acknowledged.push(id);
+    lastEnqueueMs = elapsed();
     await journal.write(
-      `${JSON.stringify({ id: job.id, acknowledgedAt: new Date().toISOString() })}\n`,
+      `${JSON.stringify({ id, acknowledgedAt: new Date().toISOString(), elapsedMs: lastEnqueueMs, attempts: failures + 1, reconciled })}\n`,
     );
-    return job;
+    return { id };
   }
 
   // Seeded worker selection is assigned the only available job before the other workers start.
@@ -250,6 +297,7 @@ try {
   });
   assert(victim.child.kill('SIGKILL'));
   await victim.exited;
+  const workerKillMs = elapsed();
 
   for (let index = 1; index < total - tailSize; index++)
     await enqueue({ type: 'transfer', payload });
@@ -261,23 +309,43 @@ try {
     15_000,
     'the five replacement workers',
   );
-  for (let index = 0; index < tailSize; index++)
-    await enqueue({ type: 'transfer', payload });
-  log(scenario === 'graceful' ? 'redis_docker_restart' : 'redis_sigkill', {
+  const produceTail = async (retry: boolean) => {
+    for (let index = 0; index < tailSize; index++) {
+      await enqueue({ type: 'transfer', payload }, retry);
+      if (retry) await setTimeout(10);
+    }
+  };
+  if (scenario !== 'continuous') await produceTail(false);
+  const restartStart = Date.now();
+  const redisCommandMs = elapsed();
+  const acknowledgedBeforeRedis = acknowledged.length;
+  log(scenario === 'hard' ? 'redis_sigkill' : 'redis_docker_restart', {
     acknowledged: acknowledged.length,
     completedSoFar: completed.size,
     recentEnqueues: tailSize,
   });
-  if (scenario === 'graceful') await container.restart();
-  else await container.kill();
+  let redisReadyMs = 0;
+  let restartEnd = 0;
+  let acknowledgedAtRedisReady = 0;
+  const restart = async () => {
+    if (scenario !== 'hard') await container.restart();
+    else await container.kill();
+    await container.start();
+    await waitFor(
+      () => redis?.status === 'ready',
+      15_000,
+      'the producer to reconnect',
+    );
+    restartEnd = Date.now();
+    redisReadyMs = elapsed();
+    acknowledgedAtRedisReady = acknowledged.length;
+    log('redis_ready', { acknowledged: acknowledged.length });
+  };
+  await Promise.all([
+    restart(),
+    scenario === 'continuous' ? produceTail(true) : undefined,
+  ]);
   await journal.sync();
-  await container.start();
-  await waitFor(
-    () => redis?.status === 'ready',
-    15_000,
-    'the producer to reconnect',
-  );
-  log('redis_ready');
 
   // An empty live queue can mean either success or AOF loss. Final states decide which IDs completed.
   const end = performance.now() + 120_000;
@@ -297,8 +365,17 @@ try {
     (id) => !observed.has(id) || !stats.receipts.has(id),
   );
   const { receipts, ...counts } = stats;
+  const duplicates = stats.handler_executions - stats.jobs_entered;
+  const acknowledgedSet = new Set(acknowledged);
+  const repeatCauses = classifyRepeats(
+    trace.filter(({ jobId }) => acknowledgedSet.has(jobId)),
+    { jobId: pauseJob.id, workerId: victimId },
+    { start: restartStart, end: restartEnd },
+    duplicates,
+  );
   const report = {
     scenario,
+    scenarioLabel,
     seed,
     workers,
     acknowledged: acknowledged.length,
@@ -307,11 +384,35 @@ try {
     receipts: receipts.size,
     lost: lost.length,
     ...counts,
-    duplicateHandlerExecutions: stats.handler_executions - stats.jobs_entered,
+    duplicateHandlerExecutions: duplicates,
+    repeatCauses: repeatCauses.counts,
+    enqueueStats,
+    timeline: {
+      firstEnqueueMs,
+      workerKillMs,
+      redisCommandMs,
+      redisReadyMs,
+      lastEnqueueMs,
+      acknowledgedBeforeRedis,
+      acknowledgedAtRedisReady,
+      finalAcknowledged: acknowledged.length,
+    },
     drainReached: drained,
-    lostIds: lost,
   };
-  log('result', { ...report, lostIds: undefined });
+  log('result', report);
+  await writeFile(
+    join(output, 'attempts.ndjson'),
+    trace.map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+  );
+  await writeFile(
+    join(output, 'repeats.ndjson'),
+    repeatCauses.repeats.map((entry) => JSON.stringify(entry)).join('\n') +
+      '\n',
+  );
+  await writeFile(
+    join(output, 'lost.ndjson'),
+    lost.map((id) => JSON.stringify({ id })).join('\n'),
+  );
   await writeFile(
     join(output, 'summary.json'),
     JSON.stringify(report, null, 2) + '\n',
@@ -327,10 +428,15 @@ try {
     'Expected a duplicate handler execution after killing the worker',
   );
   assert.equal(stats.duplicated_effects, 0, 'Duplicate committed side effects');
-  assert.equal(stats.balances[source], total - stats.debits);
+  assert.equal(stats.balances[source], total * 2 - stats.debits);
   assert.equal(stats.balances[destination], stats.credits);
   assert.equal(receipts.size, stats.receipt_effects);
-  if (scenario === 'graceful') {
+  if (scenario === 'continuous')
+    assert(
+      enqueueStats.failedAttempts > 0 && enqueueStats.retries > 0,
+      'The producer must experience and retry the outage',
+    );
+  if (scenario !== 'hard') {
     assert.equal(lost.length, 0, 'Graceful restart lost acknowledged jobs');
     assert.equal(
       stats.side_effects,
