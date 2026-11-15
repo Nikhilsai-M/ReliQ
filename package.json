@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": "^20.19.0 || ^22.13.0 || ^24.0.0"
+    "node": "^24.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').cpSync('src/lua', 'dist/src/lua', { recursive: true })\"",
@@ -34,12 +34,17 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/node": "^20.19.0",
+    "@types/node": "^24.19.2",
     "@types/pg": "^8.15.0",
     "eslint": "10.15.0",
     "prettier": "^3.6.0",
     "typescript": "~5.9.0",
-    "typescript-eslint": "~8.56.0",
-    "vitest": "^3.2.0"
+    "typescript-eslint": "^8.72.2",
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.8"
+    }
   }
 }

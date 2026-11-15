@@ -20,7 +20,7 @@ flowchart LR
 
 ## Local API and CLI
 
-Use Node 20.19 or later in the Node 20 series and Docker Compose.
+Use the latest patch of Node.js 24 LTS and Docker Compose.
 
 ```bash
 test -f .env || cp .env.example .env
@@ -61,7 +61,7 @@ Use the ID and `replayCount` returned by DLQ inspection for replay or purge. Run
 
 The `transfer` handler accepts `debitAccountId`, `creditAccountId`, and `amountCents`. Each account must exist in PostgreSQL. The demo records debit, credit, and receipt as three separate idempotent transactions. A receipt is a database row, representing a side effect within the same database.
 
-Run the crash harness from Linux or WSL with Docker Compose and Node 20. It creates disposable Compose projects with their own ports and volumes. Each scenario processes 10,000 acknowledged jobs using five recovery workers. The harness kills one worker immediately after a committed debit, then restarts or hard-kills that scenario’s Redis container during queue processing.
+Run the crash harness from Linux or WSL with Docker Compose and Node.js 24 LTS. It creates disposable Compose projects with their own ports and volumes. Each scenario processes 10,000 acknowledged jobs using five recovery workers. The harness kills one worker immediately after a committed debit, then restarts or hard-kills that scenario’s Redis container during queue processing.
 
 ```bash
 test -f .env || cp .env.example .env
