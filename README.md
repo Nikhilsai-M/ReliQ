@@ -1,5 +1,7 @@
 # ReliQ
 
+[![CI](https://github.com/Nikhilsai-M/ReliQ/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/Nikhilsai-M/ReliQ/actions/workflows/ci.yml)
+
 ReliQ is a Redis-backed job queue with lease recovery and a PostgreSQL dead-letter archive. See [the design](docs/DESIGN.md) for the state machine and durability guarantees.
 
 ```mermaid
